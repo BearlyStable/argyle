@@ -205,8 +205,12 @@ Python 3.6 is checked by running the real suite on a real 3.6 interpreter. With 
 docker run --rm -v "$PWD":/w:ro -w /w python:3.6-slim python -m unittest discover -s tests -t . -v
 ```
 
-The full suite was run and passed on CPython 3.6.15, 3.8.20, 3.11.15, 3.13.14 and 3.14.7 (also on 3.6 with IPv6
-disabled, where the IPv6 tests skip). To look for timing flakiness it was also run six times at once next to twelve
+A GitHub Actions workflow (`.github/workflows/tests.yml`) runs the suite for every push and pull request on
+Python 3.6 to 3.14: the end-of-life versions (3.6 to 3.10) in the official `python:X-slim` containers, like the
+command above, and 3.11 to 3.14 with `actions/setup-python`. From 3.7 on it runs in the strict `-X dev -W error` mode.
+
+The full suite was run and passed on CPython 3.6.15, 3.7.17, 3.8.20, 3.9.25, 3.10.22, 3.11.15, 3.12.15, 3.13.14 and
+3.14.7 (also on 3.6 with IPv6 disabled, where the IPv6 tests skip). To look for timing flakiness it was also run six times at once next to twelve
 busy loops on six cores; all six runs passed.
 
 ## Architecture and design decisions
