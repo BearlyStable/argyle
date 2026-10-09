@@ -5,7 +5,7 @@ proxy built on `asyncio`. It does exactly four things: SOCKS5 negotiation, optio
 [RFC 1929](https://www.rfc-editor.org/rfc/rfc1929) username/password authentication, TCP `CONNECT`,
 and bidirectional TCP forwarding. It is meant for development, testing, homelab and CTF use.
 
-It replaces the thread-per-connection `s5.py` baseline.
+It replaces the earlier thread-per-connection `s5.py`, which is still in the git history.
 
 ## Requirements
 
