@@ -1,0 +1,3 @@
+# Bytecode written whenever proxy.py or the tests are imported
+__pycache__/
+*.py[cod]
