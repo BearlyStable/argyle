@@ -1,0 +1,10 @@
+# Keeps the versions of the actions used in .github/workflows/ current.
+# proxy.py itself has no dependencies, so there is no other ecosystem to watch.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "ci"
