@@ -129,7 +129,9 @@ without a name lookup, so they keep working when the resolver is slow or wedged 
 
 Host names are checked before they are resolved: an empty name, a name that is not valid UTF-8 and a name with a
 control character (a NUL would cut the name off in the resolver, a newline could forge log lines) get `REP 04`.
-The command is checked first, so `BIND`/`UDP ASSOCIATE` always get `REP 07`, whatever the address.
+The command is checked before the name is, so `BIND`/`UDP ASSOCIATE` get `REP 07` whatever the address is. The one
+exception is an unknown address type (`ATYP` other than `01`, `03`, `04`): its length is unknown, so it is answered
+with `REP 08` first.
 
 ## Timeouts and connection lifecycle
 
@@ -152,6 +154,11 @@ The command is checked first, so `BIND`/`UDP ASSOCIATE` always get `REP 07`, wha
   is dropped 5 seconds after the close (`CLOSE_GRACE`) so such a peer cannot hold a file descriptor forever.
 * A relayed connection holds two file descriptors. With the common default limit of 1024 per process that is
   roughly 500 concurrent tunnels; raise it with `ulimit -n` if you need more. There is no cap of its own.
+  If the process does run out of descriptors, `accept()` fails with `EMFILE`: asyncio pauses accepting and retries
+  every second, waiting connections queue in the kernel, and the proxy serves again by itself as soon as
+  descriptors are free (a regression test pins this). With `--verbose`, asyncio logs a traceback for every failed
+  accept (about 1,800 lines in a 20 s test on Python 3.13), so do not run `--verbose` on an exhausted proxy whose
+  stderr you cannot afford to flood; without `--verbose` nothing is printed.
 * The timeouts are module constants and constructor arguments of `Socks5Server`
   (`handshake_timeout`, `connect_timeout`, `idle_timeout`). They are deliberately not command-line options.
 * Memory per connection is bounded: data is copied in 64 KiB chunks and every write is followed by
@@ -181,17 +188,18 @@ The suite uses only `unittest` (no pytest, no third-party packages). Run everyth
 | `tests/test_protocol.py`   |   119 | **Unit tests** with fake readers/writers: reply encoding; greeting and method selection; RFC 1929; requests for IPv4, IPv6 and domain names; malformed, truncated (every prefix of a valid request) and partial input; unsupported commands and address types; the exception-to-`REP` mapping; candidate ranking and time budget of `connect_upstream`; `close_writer`; argument parsing. |
 | `tests/test_integration.py`|    42 | **Integration tests** on ephemeral loopback ports with real asyncio sockets: successful connect (IPv4, IPv6, `localhost` fallback), refused and unreachable targets, unsupported command / address type, bidirectional forwarding and a 4 MiB echo, half-close both ways, fragmented and pipelined handshakes, handshake and idle timeouts, client and target disconnects (graceful and reset), shutdown, authentication, 60 concurrent clients, logging. |
 | `tests/test_cli.py`        |    28 | The real program as a **subprocess**: silent by default (exact empty stdout and stderr, also with `-X dev -W default`), `--verbose`, defaults and bind address, `python - < proxy.py`, startup failure exit status, usage errors, `--auth` end to end, signals. |
-| `tests/test_hardening.py`  |    24 | Regression tests for problems found in review: shutdown when tasks swallow cancellations, the connect budget shared between addresses, IP literals with a saturated resolver pool, a real blackholed first address, backpressure (a sender is stalled when the target does not read), byte counters in the log, silent startup errors, non-ASCII credentials, and the exit path (repeated and late signals, a resolver thread that never returns). |
+| `tests/test_hardening.py`  |    25 | Regression tests for problems found in review: shutdown when tasks swallow cancellations, the connect budget shared between addresses, IP literals with a saturated resolver pool, a real blackholed first address, backpressure (a sender is stalled when the target does not read), byte counters in the log, silent startup errors, non-ASCII credentials, and the exit path (repeated and late signals, a resolver thread that never returns), and descriptor exhaustion (a proxy limited to 40 descriptors runs out of them, and must serve again by itself once the clients leave; Linux only). |
 | `tests/test_compat.py`     |     6 | Static guards for the Python 3.6 requirement (grammar check, banned newer asyncio names, no cancellation-swallowing `except` in coroutines, standard library only). |
+| `tests/test_fuzz.py`       |    10 | **Seeded, deterministic fuzzing** of `negotiate()`, `read_request()` (including the RFC 1929 sub-negotiation) and `encode_reply()`: arbitrary and mutated bytes only ever produce `ProtocolError` or `IncompleteReadError`, replies are well-formed, valid messages round-trip, and trailing bytes stay unread. |
 
-All 219 tests use nothing but loopback: no Internet access. Failure modes that cannot be
+All 230 tests use nothing but loopback: no Internet access. Failure modes that cannot be
 produced reliably on loopback (`ENETUNREACH`, `EHOSTUNREACH`, timeouts) are injected at the boundary of the
 real code path (`socket.getaddrinfo` / `asyncio.open_connection`). A few tests skip themselves where the platform
 cannot support them (no IPv6 loopback, Linux-only behaviour such as a full accept queue as a blackhole).
 Timing-based tests use short timeouts (fractions of a second up to a few seconds) with generous margins.
 
 ```bash
-python3 -m unittest discover -s tests -t . -v                # everything (about 35 s)
+python3 -m unittest discover -s tests -t . -v                # everything (about 90 s on a small Linux VM, faster on a fast desktop)
 python3 -m unittest tests.test_protocol                      # just one module
 python3 -X dev -W error -m unittest discover -s tests -t .   # strict: any ResourceWarning becomes an error
 ```
