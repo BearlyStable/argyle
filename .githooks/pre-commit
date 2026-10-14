@@ -1,0 +1,5 @@
+#!/bin/sh
+# Enabled with `make hooks`. Fast checks only (about 10 s); the full suite belongs to /verify and CI.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+exec make --no-print-directory check

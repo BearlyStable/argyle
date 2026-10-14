@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(make check)",
+      "Bash(make test)",
+      "Bash(make strict)",
+      "Bash(make py36)",
+      "Bash(make counts)",
+      "Bash(python3 -B -m unittest *)",
+      "Bash(python3 -m unittest *)",
+      "Bash(python3 -X dev -W error -m unittest *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)"
+    ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean *)",
+      "Bash(rm -rf *)"
+    ],
+    "deny": [
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git commit * --no-verify*)",
+      "Bash(git commit * -n *)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(~/.ssh/**)",
+      "Read(~/.claude/.credentials.json)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/post_edit_check.py",
+            "args": [],
+            "timeout": 90
+          }
+        ]
+      }
+    ]
+  }
+}

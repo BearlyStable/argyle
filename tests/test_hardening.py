@@ -10,6 +10,8 @@
 * credentials in the environment without --auth are refused, and non-ASCII credentials work,
 * the process exits promptly and with status 0 however signals arrive, and even while a lookup
   is stuck in getaddrinfo().
+* running out of file descriptors (EMFILE on accept) neither kills nor wedges the listener: it serves again
+  as soon as descriptors are free.
 
 Standard library only; nothing newer than Python 3.6.
 """
@@ -33,6 +35,11 @@ import time
 import unittest
 import warnings
 from unittest import mock
+
+try:
+    import resource  # POSIX only
+except ImportError:  # pragma: no cover
+    resource = None
 
 from tests.support import ROOT, AsyncTestCase, FakeReader, FakeWriter, proxy
 
@@ -726,6 +733,55 @@ class ShutdownProcessTests(unittest.TestCase):
                 sock.sendall(connect_request("127.0.0.1", target_port))  # proxy now hangs in connect()
                 clients.append(sock)
             time.sleep(0.4)
+            running.process.send_signal(signal.SIGTERM)
+            out, err = running.process.communicate(timeout=10)
+            self.assertEqual((running.process.returncode, out, err), (0, b"", b""))
+
+
+
+# --------------------------------------------------------------------------- descriptors
+
+@unittest.skipUnless(resource is not None and hasattr(resource, "prlimit"),
+                     "needs resource.prlimit() to lower the proxy's descriptor limit (Linux)")
+class DescriptorExhaustionTests(unittest.TestCase):
+    """When accept() fails with EMFILE, asyncio pauses the listener and retries once a second.
+
+    What this pins down is that the proxy neither dies nor keeps the descriptors it already
+    accepted once those clients are gone, so it serves again by itself. Silent mode: there is
+    nothing on stderr to flood.
+    """
+
+    LIMIT = 40  # descriptors the proxy may have open (about 7 are its own)
+    CLIENTS = 90  # more than fit; the surplus waits in the kernel's accept queue
+
+    @staticmethod
+    def greeting_answered(port, timeout):
+        """True if a fresh client gets the method-selection reply within ``timeout`` seconds."""
+        try:
+            with contextlib.closing(socket.create_connection(("127.0.0.1", port), timeout=timeout)) as sock:
+                sock.settimeout(timeout)
+                sock.sendall(b"\x05\x01\x00")
+                return sock.recv(2) == b"\x05\x00"
+        except (socket.timeout, OSError):
+            return False
+
+    def test_listener_survives_running_out_of_descriptors_and_recovers(self):
+        with Running() as running:
+            resource.prlimit(running.process.pid, resource.RLIMIT_NOFILE, (self.LIMIT, self.LIMIT))
+            clients = []
+            self.addCleanup(lambda: [client.close() for client in clients])
+            for _ in range(self.CLIENTS):
+                clients.append(socket.create_connection(("127.0.0.1", running.port), timeout=5))
+            # Precondition, or the test proves nothing: the proxy really is out of descriptors.
+            # (The idle clients are only reaped after HANDSHAKE_TIMEOUT, 15 s, so this stays true.)
+            self.assertFalse(self.greeting_answered(running.port, 1.0),
+                             "the proxy still answers: the descriptor limit did not take effect")
+            for client in clients:
+                client.close()
+            deadline = time.time() + 15
+            while not self.greeting_answered(running.port, 1.0):
+                self.assertIsNone(running.process.poll(), "the proxy exited while out of descriptors")
+                self.assertLess(time.time(), deadline, "the proxy never served again after the clients left")
             running.process.send_signal(signal.SIGTERM)
             out, err = running.process.communicate(timeout=10)
             self.assertEqual((running.process.returncode, out, err), (0, b"", b""))
