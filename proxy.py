@@ -369,6 +369,17 @@ def _fmt_addr(addr):
     return "[%s]:%d" % (host, port) if ":" in host else "%s:%d" % (host, port)
 
 
+def _loggable(text):
+    """``text`` with backslashes and every non-ASCII character written as escapes, for the log.
+
+    read_request() refuses ASCII control characters only, but U+0085, U+2028 and U+2029 start a new
+    line for Unicode-aware readers and U+202E reorders the text. Names with such characters are legal
+    input (they are answered, not dropped), so they are escaped where they are logged, and so is error
+    text that can quote them. Escaping the backslash too keeps a name from imitating an escape.
+    """
+    return text.encode("unicode_escape").decode("ascii")
+
+
 def _is_loopback(host):
     try:
         return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
@@ -456,7 +467,7 @@ class Socks5Server:
                     writer.write(exc.reply)
                     await writer.drain()
                 return
-            target = _fmt_addr((host, port))
+            target = _fmt_addr((_loggable(host), port))
 
             try:
                 remote_reader, remote_writer = await connect_upstream(host, port, self.connect_timeout)
@@ -465,7 +476,7 @@ class Socks5Server:
             except Exception as exc:
                 rep = rep_for_exception(exc)
                 log.info("%s -> %s: connect failed, REP 0x%02x (%s: %s)",
-                         peer, target, rep, type(exc).__name__, exc)
+                         peer, target, rep, type(exc).__name__, _loggable(str(exc)))
                 writer.write(encode_reply(rep))
                 await writer.drain()
                 return

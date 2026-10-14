@@ -456,6 +456,51 @@ class VerboseLogTests(AsyncTestCase):
             target.close()
         self.run_async(scenario())
 
+    def test_a_hostile_name_cannot_forge_or_reorder_log_lines(self):
+        """read_request() refuses ASCII control characters, but U+0085, U+2028 and U+2029 also start a new
+        line for Unicode-aware readers and U+202E reorders the text. Such names are answered (REP 04, they
+        fail IDNA encoding before any lookup) and logged, so the log must show them escaped: in the target,
+        in the error text that quotes them (U+FFFD is printable, so repr() leaves it raw), and with a
+        literal backslash escaped as well, so that a name cannot imitate an escape."""
+        names = ("evil\u2028FAKE forged line", "evil\u0085NEL", "evil\u2029PS", "evil\u202eexe.txt",
+                 "a\ufffdb.example", "back\\slash\u2028")
+        real_getaddrinfo = socket.getaddrinfo
+        resolver_errors = {}
+
+        def recording_getaddrinfo(host, *args, **kwargs):
+            try:
+                return real_getaddrinfo(host, *args, **kwargs)
+            except Exception as exc:
+                resolver_errors[host] = exc
+                raise
+
+        async def scenario():
+            server = proxy.Socks5Server("127.0.0.1", 0)
+            await server.start()
+            with self.assertLogs("socks5", level="INFO") as logs, \
+                    mock.patch.object(socket, "getaddrinfo", recording_getaddrinfo):
+                for name in names:
+                    raw = name.encode("utf-8")
+                    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+                    writer.write(b"\x05\x01\x00" + b"\x05\x01\x00\x03" + bytes((len(raw),)) + raw
+                                 + (80).to_bytes(2, "big"))
+                    reply = await reader.readexactly(2 + 10)
+                    self.assertEqual(reply[2:4], b"\x05\x04", "REP 04 expected for %r" % name)
+                    writer.close()
+                while server.active_connections:
+                    await asyncio.sleep(0.01)
+            await server.stop()
+            return logs.output
+
+        output = self.run_async(scenario())
+        for name in names:  # no DNS traffic: each name failed IDNA encoding before the resolver
+            self.assertIsInstance(resolver_errors.get(name), UnicodeError, ascii(name))
+        text = "\n".join(output)
+        self.assertEqual(len(text.splitlines()), len(output), "a log record was split into several lines")
+        self.assertEqual([char for char in text if ord(char) > 127], [], "raw non-ASCII text reached the log")
+        for escaped in ("\\u2028", "\\x85", "\\u2029", "\\u202e", "\\ufffd", "back\\\\slash\\u2028"):
+            self.assertIn(escaped, text)
+
 
 # --------------------------------------------------------------------------- command line
 

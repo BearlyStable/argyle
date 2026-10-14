@@ -54,6 +54,11 @@ curl --proxy socks5h://alice:s3cret@127.0.0.1:1080 http://example.com/
 * Credentials come from the environment (`SOCKS5_USER`, `SOCKS5_PASS`), not from the command
   line, so they do not show up in the process list, and nothing has to be written to disk.
   `--auth` without both variables set is a usage error: the proxy never silently falls back to open.
+  The environment of a process is still readable by the same user and by root (`/proc/PID/environ`). The
+  example above also leaves the password in your shell history, and its `curl` line puts it in curl's command
+  line, where the process list shows it. To avoid both (bash or zsh), read it without echo and give it to the
+  proxy alone, then let curl ask for it: `read -rs pw; SOCKS5_USER=alice SOCKS5_PASS="$pw" python3 proxy.py --auth`
+  and `curl -U alice --proxy socks5h://127.0.0.1:1080 http://example.com/`.
 * The reverse is refused as well: `SOCKS5_USER`/`SOCKS5_PASS` set *without* `--auth` is a usage error
   (exit status 2). Credentials that were silently ignored could leave you running an open proxy
   while believing it is protected. Unset the variables to run without authentication.
@@ -132,6 +137,9 @@ control character (a NUL would cut the name off in the resolver, a newline could
 The command is checked before the name is, so `BIND`/`UDP ASSOCIATE` get `REP 07` whatever the address is. The one
 exception is an unknown address type (`ATYP` other than `01`, `03`, `04`): its length is unknown, so it is answered
 with `REP 08` first.
+Non-ASCII names are answered normally. In the `--verbose` log every non-ASCII character of a name is written as a
+backslash escape (`\u2028`), because some of them start a new line or reorder the text for whoever reads the log. A
+backslash is doubled, so a name cannot imitate an escape, and the error text of a failed connect is escaped the same way.
 
 ## Timeouts and connection lifecycle
 
@@ -188,11 +196,11 @@ The suite uses only `unittest` (no pytest, no third-party packages). Run everyth
 | `tests/test_protocol.py`   |   119 | **Unit tests** with fake readers/writers: reply encoding; greeting and method selection; RFC 1929; requests for IPv4, IPv6 and domain names; malformed, truncated (every prefix of a valid request) and partial input; unsupported commands and address types; the exception-to-`REP` mapping; candidate ranking and time budget of `connect_upstream`; `close_writer`; argument parsing. |
 | `tests/test_integration.py`|    42 | **Integration tests** on ephemeral loopback ports with real asyncio sockets: successful connect (IPv4, IPv6, `localhost` fallback), refused and unreachable targets, unsupported command / address type, bidirectional forwarding and a 4 MiB echo, half-close both ways, fragmented and pipelined handshakes, handshake and idle timeouts, client and target disconnects (graceful and reset), shutdown, authentication, 60 concurrent clients, logging. |
 | `tests/test_cli.py`        |    28 | The real program as a **subprocess**: silent by default (exact empty stdout and stderr, also with `-X dev -W default`), `--verbose`, defaults and bind address, `python - < proxy.py`, startup failure exit status, usage errors, `--auth` end to end, signals. |
-| `tests/test_hardening.py`  |    25 | Regression tests for problems found in review: shutdown when tasks swallow cancellations, the connect budget shared between addresses, IP literals with a saturated resolver pool, a real blackholed first address, backpressure (a sender is stalled when the target does not read), byte counters in the log, silent startup errors, non-ASCII credentials, and the exit path (repeated and late signals, a resolver thread that never returns), and descriptor exhaustion (a proxy limited to 40 descriptors runs out of them, and must serve again by itself once the clients leave; Linux only). |
+| `tests/test_hardening.py`  |    26 | Regression tests for problems found in review: shutdown when tasks swallow cancellations, the connect budget shared between addresses, IP literals with a saturated resolver pool, a real blackholed first address, backpressure (a sender is stalled when the target does not read), byte counters in the log, hostile Unicode in host names escaped in the log, silent startup errors, non-ASCII credentials, and the exit path (repeated and late signals, a resolver thread that never returns), and descriptor exhaustion (a proxy limited to 40 descriptors runs out of them, and must serve again by itself once the clients leave; Linux only). |
 | `tests/test_compat.py`     |     6 | Static guards for the Python 3.6 requirement (grammar check, banned newer asyncio names, no cancellation-swallowing `except` in coroutines, standard library only). |
 | `tests/test_fuzz.py`       |    10 | **Seeded, deterministic fuzzing** of `negotiate()`, `read_request()` (including the RFC 1929 sub-negotiation) and `encode_reply()`: arbitrary and mutated bytes only ever produce `ProtocolError` or `IncompleteReadError`, replies are well-formed, valid messages round-trip, and trailing bytes stay unread. |
 
-All 230 tests use nothing but loopback: no Internet access. Failure modes that cannot be
+All 231 tests use nothing but loopback: no Internet access. Failure modes that cannot be
 produced reliably on loopback (`ENETUNREACH`, `EHOSTUNREACH`, timeouts) are injected at the boundary of the
 real code path (`socket.getaddrinfo` / `asyncio.open_connection`). A few tests skip themselves where the platform
 cannot support them (no IPv6 loopback, Linux-only behaviour such as a full accept queue as a blackhole).
@@ -315,6 +323,25 @@ Version differences that are handled explicitly rather than assumed away:
 * `asyncio.wait_for()` can drop a cancellation on 3.8 to 3.11 (see "Other decisions"); `stop()` compensates.
 * Newer Pythons deprecate or remove `asyncio.get_event_loop()` outside a running loop (3.12 warns, 3.14 raises);
   the entry point creates and installs its own loop and only calls `get_event_loop()` from inside coroutines.
+
+### Known limits
+
+Found in a security review (2026-10-14); the figures were measured on Python 3.13. None has a complete fix with the
+standard library alone. A connection cap and a refusal to connect to the proxy itself, open decisions D-1 and D-3 in
+ROADMAP.md, would soften the first and the last. Fine for the intended use, relevant if you expose the proxy beyond a
+network you trust (use `--auth`, a firewall and `ulimit`).
+
+* **A client can chain through the proxy to itself.** `CONNECT` to the proxy's own listening address works, so one
+  client connection can stack layers of it. Each layer costs two descriptors and another copy of every byte
+  through the one event loop (100 layers held about 200 descriptors, and a 4 MiB transfer took 9 s of CPU instead of 0.15 s).
+  Everything is released when the client leaves.
+* **Name lookups share one fixed thread pool** (asyncio's default executor: min(32, CPUs + 4) threads on Python 3.8 and
+  later, five per CPU on 3.6 and 3.7). Clients that send names whose lookup hangs can keep every thread busy, and
+  then other names fail with `REP 06` after the 10 s connect budget. IP literals are not affected.
+* **A stalled tunnel holds up to about 0.5 MiB of user-space memory per stalled direction, about 1 MiB if both
+  stall**, not the 64 KiB of one chunk: asyncio pauses reading only once a stream buffer holds more than twice the
+  64 KiB limit, a single read can add 256 KiB to it, and the write buffer takes up to about 128 KiB more. Memory is
+  still bounded, but with `ulimit -n 65536` a flood of stalled tunnels can mean gigabytes.
 
 ### Not implemented (deliberately)
 
