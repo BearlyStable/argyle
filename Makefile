@@ -4,7 +4,7 @@ PY ?= python3
 
 help:
 	@echo "make check   static Python 3.6 guards + protocol unit tests (seconds)"
-	@echo "make test    full suite (about 100 s)"
+	@echo "make test    full suite (about 90 s)"
 	@echo "make strict  full suite with -X dev -W error, as CI runs it on 3.7+"
 	@echo "make py36    full suite on Python 3.6 in Docker"
 	@echo "make counts  number of tests per module"

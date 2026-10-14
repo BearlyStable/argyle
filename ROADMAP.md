@@ -33,8 +33,8 @@ Checked by reading all of `proxy.py`, running the suite and exercising a live in
 | G3 | Met | Only standard-library imports; `test_compat` guards it. |
 | G4 | **Unverified here** | The suite passes on 3.13.9 (219 tests). 3.6 to 3.12 and 3.14 are claimed by the README and covered by CI, but the repository is private, `gh` is not logged in here, and Docker is not installed, so no run of CI or of 3.6 could be seen from this machine. |
 | G5 | Met | Defaults, `--auth` checks and the non-loopback warning behave as documented. Accepted and documented risks: clear-text RFC 1929, no rate limit, no cap. |
-| G6 | Met, one gap | With `ulimit -n 64` and 150 idle clients the proxy stayed up and served again as soon as descriptors were free. No test pins this (M1.1). With `--verbose` that situation floods stderr: asyncio logs one traceback per failed `accept` (about 1,800 lines in a 20 s run); silent mode is unaffected. |
-| G7 | Met, one stale claim | 219 tests, counts match the README table. The README says the suite takes "about 35 s"; here it takes about 100 s (`test_hardening` 35 s, `test_cli` 28 s, `test_integration` 11 s, `test_protocol` 5 s, `test_compat` 3 s). Either the number or the machine is off (M0.3). |
+| G6 | Met, one gap | With `ulimit -n 64` and 150 idle clients the proxy stayed up and served again as soon as descriptors were free. No test pins this (M1.1). With `--verbose` that situation floods stderr: asyncio logs one traceback per failed `accept` (about 1,800 lines in a 20 s run); silent mode is unaffected. Since then: pinned by a test and documented (M1.1, M1.2). |
+| G7 | Met, one stale claim | 219 tests, counts match the README table. The README says the suite takes "about 35 s"; here it takes about 100 s (`test_hardening` 35 s, `test_cli` 28 s, `test_integration` 11 s, `test_protocol` 5 s, `test_compat` 3 s). Either the number or the machine is off (M0.3). Fixed in M0.3. |
 | G8 | Met, one gap | No evasion features. There is no `LICENSE` file, so by default nobody else may legally use or share it (M0.4). |
 
 Conclusion: the project matches its goals. What is missing is evidence that CI is green on all nine Pythons,
@@ -44,18 +44,19 @@ a licence, and two small hardening/regression items. The deliberate non-goals ar
 
 - [ ] **M0.1** Confirm CI is green on Python 3.6 to 3.14 (Actions tab; invisible from here). *Owner.*
 - [ ] **M0.2** Merge the two Dependabot PRs (`actions/checkout` 4→7, `actions/setup-python` 5→7) after their CI runs are green. *Owner / lead.*
-- [ ] **M0.3** Re-measure the suite time and fix the README ("about 35 s"). *docs-keeper.*
+- [x] **M0.3** Re-measure the suite time and fix the README ("about 35 s"). *docs-keeper.* (README, Tests section: now "about 90 s", measured with `make test` on a small Linux VM.)
 - [ ] **M0.4** Choose and add a `LICENSE`. *Owner decision: MIT, BSD, Apache-2.0, GPL, or none on purpose.*
 - [ ] **M0.5** Review and commit the tooling (`CLAUDE.md`, `.claude/`, `docs/`, `Makefile`, `.githooks/`, templates); run `make hooks` once per clone. *Owner.*
 - [ ] **M0.6** Run `/agents` once and confirm all nine agents load and that your plan can use the `fable` model (`devils-advocate`); change `model:` there if not. *Owner.*
 
 ## M1: close the gaps inside the current scope (no new features)
 
-- [ ] **M1.1** Regression test: the listener survives file-descriptor exhaustion (`EMFILE` on accept) and serves again once descriptors are free. *test-engineer.*
-- [ ] **M1.2** Document the `--verbose` log flood under descriptor exhaustion (README), or coalesce it. Lean: document only; it is a debug mode and the flood comes from asyncio. *architect, then devils-advocate.*
-- [ ] **M1.3** Seeded, deterministic fuzz test for the parsers (`negotiate`, `read_request`): arbitrary and mutated input never raises anything but `ProtocolError`/`IncompleteReadError` and never hangs. *test-engineer.*
+- [x] **M1.1** Regression test: the listener survives file-descriptor exhaustion (`EMFILE` on accept) and serves again once descriptors are free. *test-engineer.* (tests/test_hardening.py, `DescriptorExhaustionTests`)
+- [x] **M1.2** Document the `--verbose` log flood under descriptor exhaustion (README), or coalesce it. Lean: document only; it is a debug mode and the flood comes from asyncio. *architect, then devils-advocate.* (README, Timeouts and connection lifecycle)
+- [x] **M1.3** Seeded, deterministic fuzz test for the parsers (`negotiate`, `read_request`): arbitrary and mutated input never raises anything but `ProtocolError`/`IncompleteReadError` and never hangs. *test-engineer.* (tests/test_fuzz.py)
 - [ ] **M1.4** Baseline security review of `proxy.py` (all four threat actors in `security-auditor`). *security-auditor.*
-- [ ] **M1.5** Baseline RFC 1928/1929 conformance matrix; every deviation documented. *rfc-conformance.*
+- [x] **M1.5** Baseline RFC 1928/1929 conformance matrix; every deviation documented. *rfc-conformance.* (`docs/CONFORMANCE.md`: no undocumented wire deviation; one README inaccuracy fixed, see M1.7 for the rest)
+- [ ] **M1.7** Close the conformance gaps: README rows for the RSV byte, the RFC 1929 failure reply (`01 01`, then close) and zero-length credentials; tests for zero-length UNAME/PASSWD on the wire and for the EOF that follows an error reply. *docs-keeper, test-engineer.*
 - [ ] **M1.6** Decide on macOS/Windows: add CI jobs, or state "Linux only, others best effort" in the README. Needs CI access to try. *Owner, then test-engineer.*
 
 ## M2: owner decisions on the non-goals
