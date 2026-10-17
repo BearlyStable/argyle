@@ -408,3 +408,8 @@ network you trust (use `--auth`, a firewall and `ulimit`).
 SOCKS4/4a, `BIND`, `UDP ASSOCIATE`, GSSAPI authentication, access-control lists, rate limiting, a cap on
 concurrent connections, and any kind of tunnelling, obfuscation or evasion. Use the operating system's
 limits (`ulimit -n`) and firewall for resource and access control.
+
+## Licence
+
+MIT, see [`LICENSE`](LICENSE). `proxy.py` carries the same notice in its first lines, so the file can be passed on
+on its own.

@@ -16,6 +16,7 @@ All notable changes to `proxy.py`. Versions follow [semantic versioning](https:/
     listening socket for good after one failed accept (CPython gh-93821: a client that resets at the wrong moment, as
     a port scan does, would otherwise end service silently).
 - `--version` prints `proxy.py 1.1.0`.
+- The MIT licence (`LICENSE`, and a notice at the top of `proxy.py`).
 - Python 3.15 is tested in CI.
 
 ### Fixed

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 lazyfp. MIT License: see LICENSE or https://opensource.org/license/mit
 """Small SOCKS5 (RFC 1928) CONNECT proxy: asyncio, standard library only.
 
     python3 proxy.py [--host 127.0.0.1] [--port 1080] [--verbose] [--auth] [--version]

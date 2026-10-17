@@ -35,10 +35,10 @@ Checked by reading all of `proxy.py`, running the suite and exercising a live in
 | G5 | Met | Defaults, `--auth` checks and the non-loopback warning behave as documented. Accepted and documented risks: clear-text RFC 1929, no rate limit, no cap. |
 | G6 | Met | With `ulimit -n 64` and 150 idle clients the proxy stayed up and served again as soon as descriptors were free; pinned by a test (M1.1). With `--verbose` that situation floods stderr: asyncio logs one traceback per failed `accept` (re-measured 2026-10-15: about 7,000 to 8,000 tracebacks, over 40,000 lines, in 20 s; the first figure, 1,800 lines, was about 20 times too low); silent mode is unaffected (M1.2). |
 | G7 | Met | Counts match the README table (`make counts`). The M0.7 review found the fuzz tests rarely got past the first byte and the ERROR-record guard had two blind spots; both fixed with mutation evidence (see M0.7). |
-| G8 | Met, one gap | No evasion features. There is no `LICENSE` file yet, so by default nobody else may legally use or share it (M0.4). |
+| G8 | Met | No evasion features. MIT licence since 2026-10-17 (M0.4). |
 
 Conclusion (2026-10-15): the project matches its goals on Linux, and Windows support was added (M1.6). Open: the
-licence (M0.4) and the release itself (M3). The non-goals stay non-goals (M2, decided).
+release itself (M3.2); the licence is MIT (M0.4, 2026-10-17). The non-goals stay non-goals (M2, decided).
 
 ## M0: verify and tidy (do first)
 
@@ -49,7 +49,8 @@ licence (M0.4) and the release itself (M3). The non-goals stay non-goals (M2, de
   than by merging the Dependabot PRs, whose own CI runs were green). Both v7 releases exist (published 2026-07-20).
   Dependabot closed PRs #1 and #2 itself when main got the versions (2026-10-14 11:19).
 - [x] **M0.3** Re-measure the suite time and fix the README ("about 35 s"). *docs-keeper.* (README, Tests section: now "about 90 s", measured with `make test` on a small Linux VM.)
-- [ ] **M0.4** Choose and add a `LICENSE`. *Owner decision: MIT, BSD, Apache-2.0, GPL, or none on purpose.*
+- [x] **M0.4** Choose and add a `LICENSE`. Owner decision 2026-10-17: MIT (`LICENSE`, and a notice in the first lines
+  of `proxy.py`, which is released as a single file).
 - [x] **M0.5** The tooling is committed (1c04af1 and later); `make hooks` was run in this clone on 2026-10-15. The
   pre-commit hook now checks the staged content, exported to a temporary directory (a broken staged `proxy.py` with
   a good working copy is refused; tested in a scratch clone).
@@ -103,7 +104,7 @@ only with a concrete user need.
 
 ## M3: release readiness
 
-- [ ] **M3.1** `LICENSE` (M0.4). No `SECURITY.md`: owner decision 2026-10-15 (the repository is private).
+- [x] **M3.1** `LICENSE` (M0.4: MIT). No `SECURITY.md`: owner decision 2026-10-15 (the repository is private).
 - [ ] **M3.2** `--version` and `CHANGELOG.md` are done (1.1.0). Left: the `v1.1.0` tag and a GitHub release of the
   single file. `v1.0.0` already exists at cdb074b (2026-10-09) and is not moved. No PyPI package unless the owner wants
   one: it conflicts with "one file, nothing to install".
@@ -120,3 +121,4 @@ only with a concrete user need.
 | 2026-10-15 | `__version__` and `--version`; hard constraint 4 reworded: a running proxy is silent without `--verbose`, and `--help`/`--version` (stdout, exit 0) and usage errors (stderr, exit 2) are the only other output | Owner asked to finish the project, which M3.2 includes; `--help` already printed, so the old wording was not literally true |
 | 2026-10-15 | Windows supported on Python 3.8+ (CI on windows-latest); macOS best effort. On Windows: `signal.signal()` handlers for SIGINT/SIGBREAK, Win32 connect errors mapped by `winerror`, UTF-8 credentials, and an own accept loop (`_listen`, `_accept_loop`) instead of `start_server()` because of CPython gh-93821 | Owner: Linux required, Windows welcome. Rejected: Windows 3.6/3.7 (512-socket `select()`), a listener watchdog that re-binds (a repeating client keeps it closed; port can be taken in the gap), SelectorEventLoop on Windows, a macOS CI job (10x minutes, no need) |
 | 2026-10-15 | Guard git in Claude Code with a PreToolUse hook rather than glob deny rules | Glob rules cannot parse git options; the hook's tests run in `make check` |
+| 2026-10-17 | MIT licence | Owner |
