@@ -1,10 +1,11 @@
-# Runs the whole test suite on every Python the project supports, 3.6 to 3.14.
+# Runs the whole test suite on every Python the project supports: 3.6 to 3.15 on Linux, 3.8 to 3.15 on Windows.
 #
 # End-of-life interpreters (3.6 to 3.10) run in the official python:X-slim container, the same way
 # README.md suggests trying 3.6 locally; hosted runners no longer provide them reliably. Current
 # interpreters use actions/setup-python. From 3.7 on the suite runs in strict mode (-X dev turns on
 # ResourceWarning and asyncio debug checks, -W error makes any warning a failure); -X dev does not
-# exist on 3.6.
+# exist on 3.6. Windows starts at 3.8, the first version whose default event loop (Proactor) is not
+# limited to 512 sockets by select(). A pushed v* tag must match what proxy.py --version prints.
 name: tests
 
 on:
@@ -50,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12", "3.13", "3.14"]
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -60,3 +61,37 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run the test suite
         run: python -X dev -W error -m unittest discover -s tests -t . -v
+
+  windows:
+    name: Python ${{ matrix.python }} (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.11", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the test suite
+        run: python -X dev -W error -m unittest discover -s tests -t . -v
+
+  release-version:
+    name: Tag matches --version
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Compare the tag with proxy.py --version
+        run: |
+          expected="proxy.py ${GITHUB_REF_NAME#v}"
+          actual="$(python3 proxy.py --version)"
+          echo "tag: $expected, proxy.py: $actual"
+          test "$actual" = "$expected"

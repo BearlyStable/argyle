@@ -744,6 +744,36 @@ class ReplyCodeMappingTests(unittest.TestCase):
                 self.assertIsNone(exc.errno)
                 self.assertEqual(proxy.rep_for_exception(exc), expected)
 
+    def test_windows_overlapped_connect_errors_are_told_apart_by_winerror(self):
+        """CPython turns ERROR_SEM_TIMEOUT (121), ERROR_NETWORK_UNREACHABLE (1231) and
+        ERROR_HOST_UNREACHABLE (1232) of an overlapped ConnectEx into errno EINVAL; the winerror
+        attribute is all that is left to tell them apart: 6, 3 and 4 instead of 1.
+
+        This mirrors the table in proxy.py, it is not evidence of what Windows reports; the
+        attribute is set by hand so the test runs everywhere."""
+        for winerror, expected in ((1231, 3), (1232, 4), (121, 6)):
+            with self.subTest(winerror=winerror):
+                exc = OSError(errno.EINVAL, "x")
+                exc.winerror = winerror
+                self.assertEqual(proxy.rep_for_exception(exc), expected)
+        plain = OSError(errno.EINVAL, "x")
+        self.assertEqual(proxy.rep_for_exception(plain), proxy.REP_GENERAL_FAILURE)  # no winerror: errno table
+        # winerror is looked at before the errno table
+        exc = OSError(errno.ENETUNREACH, "x")
+        exc.winerror = 1232
+        self.assertEqual(proxy.rep_for_exception(exc), proxy.REP_HOST_UNREACHABLE)
+
+    def test_an_unknown_winerror_falls_back_to_the_errno_table(self):
+        """Any other winerror (or none) is judged by errno as before: 10051 with ENETUNREACH is 3,
+        with EINVAL it is the general failure; winerror None changes nothing."""
+        for winerror, code, expected in ((10051, errno.ENETUNREACH, 3), (10051, errno.EINVAL, 1),
+                                         (5, errno.EHOSTUNREACH, 4), (None, errno.ETIMEDOUT, 6),
+                                         (0, errno.EINVAL, 1)):
+            with self.subTest(winerror=winerror, errno=code):
+                exc = OSError(code, "x")
+                exc.winerror = winerror
+                self.assertEqual(proxy.rep_for_exception(exc), expected)
+
     def test_only_connect_failure_codes_are_ever_returned(self):
         """Every result is one of the six failure codes connect_upstream() can rank (else it would crash)."""
         for description, exc, _ in self.cases():
@@ -1168,6 +1198,19 @@ class HandlerTests(ProtocolTestCase):
             self.run_async(server._serve(reader, writer))
         return reader, writer
 
+    def test_the_accepted_address_names_the_client_when_the_transport_has_no_peername(self):
+        """The own accept loop passes the address accept() returned: a client that already reset has
+        no peername on its transport, and the log line still says who it was. A peername wins."""
+        for peername, expected in ((None, "203.0.113.7:4000"), (("198.51.100.1", 5555), "198.51.100.1:5555")):
+            with self.subTest(peername=peername):
+                writer = HandlerWriter(peername=peername)
+                server = proxy.Socks5Server()
+                with self.assertLogs("socks5", level="INFO") as captured:
+                    self.run_async(server._serve(FakeReader(greeting(0, version=4)), writer,
+                                                 ("203.0.113.7", 4000)))
+                messages = [record.getMessage() for record in captured.records]
+                self.assertTrue(any(m.startswith(expected + ": rejected") for m in messages), messages)
+
     def test_success_reply_reports_the_outgoing_socket_and_hands_over_to_relay(self):
         """Success: 05 00, then REP 00 with the upstream socket as BND; server timeouts reach connect/relay."""
         remote_reader = FakeReader(b"")
@@ -1554,6 +1597,55 @@ class ParseArgsTests(unittest.TestCase):
         args = self.parse()
         self.assertIs(args.auth, False)
         self.assertIsNone(args.credentials)
+
+    def test_version_prints_name_and_version_and_exits_zero(self):
+        """--version: stdout is exactly ``proxy.py <__version__>`` and a newline, stderr stays empty,
+        status 0, also when SOCKS5_USER is set without --auth and when --auth has no credentials
+        (the credential checks come after it)."""
+        for argv, env in ((["--version"], {}),
+                          (["--version"], {"SOCKS5_USER": "alice"}),
+                          (["--version"], {"SOCKS5_USER": "alice", "SOCKS5_PASS": "s3cret"}),
+                          (["--auth", "--version"], {}),
+                          (["--version", "--auth"], {})):
+            with self.subTest(argv=argv, env=sorted(env)):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with environ(**env), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        proxy._parse_args(argv)
+                self.assertEqual(caught.exception.code, 0)
+                self.assertEqual(stdout.getvalue(), "proxy.py %s\n" % proxy.__version__)
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_version_is_three_dotted_numbers(self):
+        """__version__ is MAJOR.MINOR.PATCH, nothing else (packaging and the --version output rely on it)."""
+        self.assertRegex(proxy.__version__, r"^\d+\.\d+\.\d+$")
+
+    def test_credentials_on_windows_are_utf8_whatever_the_filesystem_encoding(self):
+        """The Windows environment is UTF-16; the credentials go on the wire as UTF-8 even when
+        os.fsencode() would give '?' (PYTHONLEGACYWINDOWSFSENCODING), and lone surrogates survive."""
+        user, password = u"j\u00fcrgen", u"p\u00e4ss\u2603"
+
+        def lossy_fsencode(text):
+            return text.encode("ascii", "replace")
+
+        with mock.patch.object(proxy.sys, "platform", "win32"), \
+                mock.patch.object(os, "fsencode", side_effect=lossy_fsencode) as fsencode:
+            args = self.parse("--auth", SOCKS5_USER=user, SOCKS5_PASS=password)
+            self.assertEqual(proxy._env_bytes(u"\ud800"), b"\xed\xa0\x80")
+        fsencode.assert_not_called()
+        self.assertEqual(args.credentials, (user.encode("utf-8"), password.encode("utf-8")))
+        # the 255-byte limit counts the UTF-8 bytes there too
+        with mock.patch.object(proxy.sys, "platform", "win32"):
+            code, _ = self.parse_fails("--auth", SOCKS5_USER=u"\u00fc" * 128, SOCKS5_PASS="pw")
+        self.assertEqual(code, 2)
+
+    def test_credentials_elsewhere_still_use_the_filesystem_encoding(self):
+        """Off Windows the bytes are os.fsencode()'s, as before (the surrogateescape round trip)."""
+        with mock.patch.object(proxy.sys, "platform", "linux"), \
+                mock.patch.object(os, "fsencode", side_effect=lambda text: b"via-fsencode") as fsencode:
+            args = self.parse("--auth", SOCKS5_USER="u", SOCKS5_PASS="p")
+        self.assertEqual(args.credentials, (b"via-fsencode", b"via-fsencode"))
+        self.assertEqual(fsencode.call_count, 2)
 
     def test_non_ascii_credentials_are_the_exact_bytes_from_the_environment(self):
         """os.fsencode() hands back the bytes the shell provided, whatever the locale."""

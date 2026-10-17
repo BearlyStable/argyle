@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Small SOCKS5 (RFC 1928) CONNECT proxy: asyncio, standard library only.
 
-    python3 proxy.py [--host 127.0.0.1] [--port 1080] [--verbose] [--auth]
+    python3 proxy.py [--host 127.0.0.1] [--port 1080] [--verbose] [--auth] [--version]
     python3 - [options] < proxy.py        # run from stdin; nothing is written to disk
 
 Scope: SOCKS5 negotiation, optional RFC 1929 username/password authentication,
@@ -27,6 +27,12 @@ Behaviour that differs between Python versions and is handled explicitly:
   * asyncio.TimeoutError is not the builtin TimeoutError before 3.11; both are mapped.
   * asyncio.wait_for() can swallow a cancellation that arrives just as the awaited
     thing finishes (3.8-3.11), so shutdown cancels client tasks repeatedly until they end.
+
+Windows is supported on Python 3.8+ only (the default ProactorEventLoop). Ctrl-C and Ctrl-Break stop
+the proxy there through signal.signal() handlers, because the loop has no add_signal_handler(); other
+processes cannot send SIGTERM on Windows (taskkill /F and Popen.terminate() end the process at once).
+There the proxy also accepts connections itself instead of through asyncio's server: asyncio closes its
+listening socket for good when one accept fails (CPython gh-93821), e.g. after a client reset.
 """
 
 import argparse
@@ -40,6 +46,8 @@ import signal
 import socket
 import sys
 import warnings
+
+__version__ = "1.1.0"
 
 log = logging.getLogger("socks5")
 
@@ -74,6 +82,13 @@ CONNECT_TIMEOUT = 10.0  # seconds: name resolution + TCP connect to the target
 IDLE_TIMEOUT = 300.0  # seconds without data in either direction of a relayed connection
 CLOSE_GRACE = 5.0  # seconds a closing socket may keep flushing data to a peer that stopped reading
 BUFFER_SIZE = 64 * 1024  # per-read chunk and StreamReader limit; bounds memory per connection
+
+# On Windows asyncio's server closes its listening socket for good when one accept fails (CPython
+# gh-93821, open), so the proxy accepts by itself there and the socket is never closed by an error.
+_OWN_ACCEPT = sys.platform == "win32"
+ACCEPT_RETRY_DELAY = 1.0  # seconds to wait after EMFILE and friends, like asyncio's own server
+ACCEPT_ERROR_DELAY = 0.01  # seconds after an unexpected accept error, so a failing listener cannot spin the CPU
+ACCEPT_ERROR_BURST = 200  # consecutive unexpected errors that only yield before that delay, see _accept_loop
 
 EXIT_STARTUP_FAILED = 1
 
@@ -199,6 +214,29 @@ for _name, _rep in (
     if hasattr(errno, _name):
         _ERRNO_TO_REP[getattr(errno, _name)] = _rep
 
+# Accept errors that mean "out of resources, try again later" rather than "that one client went away".
+_ACCEPT_RESOURCE_ERRNOS = frozenset(
+    getattr(errno, _name) for _name in ("EMFILE", "ENFILE", "ENOBUFS", "ENOMEM", "WSAEMFILE", "WSAENOBUFS")
+    if hasattr(errno, _name))
+# Accept errors caused by the client, which went away before the accept completed. Each one used up one of
+# its connections, so they are never paused for: pausing would let a client that resets in a loop slow the
+# accepting of everybody else. Windows reports them as ERROR_UNEXP_NET_ERR (59), ERROR_NETNAME_DELETED (64),
+# ERROR_CONNECTION_ABORTED (1236), WSAECONNRESET (10054) or WSAENOTCONN (10057, from getpeername).
+_ACCEPT_PEER_WINERRORS = frozenset((59, 64, 1236, 10054, 10057))
+
+
+def _client_went_away(exc):
+    return (isinstance(exc, (ConnectionResetError, ConnectionAbortedError))
+            or getattr(exc, "winerror", None) in _ACCEPT_PEER_WINERRORS)
+
+# Overlapped ConnectEx failures on Windows: CPython's PC/errmap.h turns these Win32 codes into
+# errno EINVAL, so the errno table cannot tell them apart. 1225 (refused) needs no entry: it
+# already arrives as ConnectionRefusedError.
+_WINERROR_TO_REP = {
+    121: REP_TTL_EXPIRED,  # ERROR_SEM_TIMEOUT
+    1231: REP_NETWORK_UNREACHABLE,  # ERROR_NETWORK_UNREACHABLE
+    1232: REP_HOST_UNREACHABLE}  # ERROR_HOST_UNREACHABLE
+
 # When several addresses of one name fail differently, report the most informative
 # failure: a refusal proves the host answered, an unreachable network proves little.
 _REP_PRECEDENCE = (REP_CONNECTION_REFUSED, REP_TTL_EXPIRED, REP_HOST_UNREACHABLE,
@@ -221,6 +259,9 @@ def rep_for_exception(exc):
     if isinstance(exc, PermissionError):
         return REP_NOT_ALLOWED
     if isinstance(exc, OSError):
+        winerror = getattr(exc, "winerror", None)
+        if winerror in _WINERROR_TO_REP:
+            return _WINERROR_TO_REP[winerror]
         return _ERRNO_TO_REP.get(exc.errno, REP_GENERAL_FAILURE)
     if isinstance(exc, ValueError):  # e.g. UnicodeError: name not IDNA-encodable
         return REP_HOST_UNREACHABLE
@@ -387,8 +428,51 @@ def _is_loopback(host):
         return False
 
 
+async def _listen(host, port):
+    """Listening sockets made like asyncio's create_server() does (one per address, non-blocking)."""
+    loop = asyncio.get_event_loop()
+    infos = await loop.getaddrinfo(host or None, port, family=socket.AF_UNSPEC,
+                                   type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    sockets = []
+    completed = False
+    try:
+        for af, socktype, proto, _canon, address in sorted(set(infos)):
+            try:
+                sock = socket.socket(af, socktype, proto)
+            except OSError:  # a bad family/protocol combination: skip it, as asyncio does
+                continue
+            sockets.append(sock)
+            if os.name == "posix":  # on Windows SO_REUSEADDR would allow port hijacking
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+            if af == socket.AF_INET6 and hasattr(socket, "IPPROTO_IPV6"):
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, True)
+            try:
+                sock.bind(address)
+            except OSError as err:
+                if err.errno == errno.EADDRNOTAVAIL:  # the family is not enabled (bpo-30945)
+                    sockets.pop()
+                    sock.close()
+                    continue
+                raise OSError(err.errno, "error while attempting to bind on address %r: %s"
+                              % (address, str(err).lower())) from None
+            sock.listen(100)
+            sock.setblocking(False)
+        if not sockets:
+            raise OSError("could not bind on any address out of %r" % ([info[4] for info in infos],))
+        completed = True
+    finally:
+        if not completed:
+            for sock in sockets:
+                sock.close()
+    return sockets
+
+
 class Socks5Server:
-    """Listens for SOCKS5 clients and serves each one in its own coroutine."""
+    """Listens for SOCKS5 clients and serves each one in its own coroutine.
+
+    On Windows (``_own_accept``) it owns the listening sockets and accepts on them itself, because
+    asyncio's server closes its socket for good after one failed accept (CPython gh-93821).
+    """
 
     def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, credentials=None,
                  handshake_timeout=HANDSHAKE_TIMEOUT, connect_timeout=CONNECT_TIMEOUT,
@@ -402,6 +486,9 @@ class Socks5Server:
         self._server = None
         self._tasks = set()
         self._closing = False
+        self._own_accept = _OWN_ACCEPT  # tests set it to exercise the own accept loop on Linux
+        self._sockets = []  # own listening sockets
+        self._accept_tasks = []
 
     @property
     def active_connections(self):
@@ -410,20 +497,97 @@ class Socks5Server:
 
     async def start(self):
         """Bind and start accepting; ``self.port`` is updated with the bound port."""
-        self._server = await asyncio.start_server(
-            self._on_connect, self.host, self.port, limit=BUFFER_SIZE)
-        for sock in self._server.sockets:
+        if self._own_accept:
+            self._sockets = await _listen(self.host, self.port)
+            socks = self._sockets
+        else:
+            self._server = await asyncio.start_server(
+                self._on_connect, self.host, self.port, limit=BUFFER_SIZE)
+            socks = self._server.sockets
+        for sock in socks:
             addr = sock.getsockname()
             log.info("listening on %s (%s)", _fmt_addr(addr),
                      "username/password authentication" if self.credentials else "no authentication")
             if not self.credentials and not _is_loopback(addr[0]):
                 log.warning("%s is not a loopback address and authentication is off: "
                             "anyone who can reach it can use this proxy", _fmt_addr(addr))
-        self.port = self._server.sockets[0].getsockname()[1]
+        self.port = socks[0].getsockname()[1]
+        for sock in self._sockets:
+            self._accept_tasks.append(asyncio.ensure_future(self._accept_loop(sock)))
+
+    async def _accept_loop(self, listener):
+        """Accept on one listening socket until cancelled; an accept error never closes it."""
+        loop = asyncio.get_event_loop()
+        failures = 0
+        while True:
+            try:
+                conn, address = await loop.sock_accept(listener)
+            except asyncio.CancelledError:
+                raise
+            except OSError as exc:
+                log.debug("accept failed: %s: %s", type(exc).__name__, exc)
+                if exc.errno in _ACCEPT_RESOURCE_ERRNOS:
+                    await asyncio.sleep(ACCEPT_RETRY_DELAY)
+                elif _client_went_away(exc):
+                    await asyncio.sleep(0)
+                else:
+                    # Unexpected: retry at once a few times (a burst of them can still be clients
+                    # going away in a way not listed above), then never faster than every 10 ms.
+                    failures += 1
+                    await asyncio.sleep(ACCEPT_ERROR_DELAY if failures > ACCEPT_ERROR_BURST else 0)
+                continue
+            failures = 0
+            if self._closing:
+                conn.close()
+                return
+            started = []
+            task = asyncio.ensure_future(self._serve_accepted(conn, address, started))
+            self._tasks.add(task)
+
+            def finished(task, conn=conn, started=started):
+                self._tasks.discard(task)
+                if not started:  # cancelled before it ever ran: nothing owns the socket
+                    conn.close()
+
+            task.add_done_callback(finished)
+
+    async def _serve_accepted(self, conn, address, started):
+        started.append(True)
+        try:
+            reader, writer = await asyncio.open_connection(sock=conn, limit=BUFFER_SIZE)
+        except asyncio.CancelledError:
+            conn.close()
+            raise
+        except Exception:  # e.g. the client reset already; nothing owns the socket yet
+            conn.close()
+            return
+        # The transport cannot ask a client that has already reset for its address; accept knew it.
+        await self._serve(reader, writer, address)  # its finally closes the writer
 
     async def stop(self):
         """Stop listening, cancel every client coroutine and wait until they are gone."""
         self._closing = True
+        # Before the listeners are closed, so that no pending accept runs on a closed socket.
+        # Cancelled repeatedly for the same reason as the clients below.
+        for _ in range(20):
+            tasks = [task for task in self._accept_tasks if not task.done()]
+            if not tasks:
+                break
+            for task in tasks:
+                task.cancel()
+            await asyncio.wait(tasks, timeout=0.25)
+        loop = asyncio.get_event_loop()
+        for sock in self._sockets:
+            try:
+                # Python 3.6 leaves the reader of a cancelled sock_accept registered, and it would
+                # fail on the closed socket; the proactor loop has no readers at all.
+                loop.remove_reader(sock.fileno())
+            except (NotImplementedError, OSError, ValueError):
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
         if self._server is not None:
             self._server.close()
         # Cancel repeatedly, not once: on Python 3.8-3.11 asyncio.wait_for() can swallow a
@@ -454,9 +618,9 @@ class Socks5Server:
 
         task.add_done_callback(finished)
 
-    async def _serve(self, reader, writer):
+    async def _serve(self, reader, writer, address=None):
         """One client from accept to close. Never raises except CancelledError."""
-        peer = _fmt_addr(writer.get_extra_info("peername"))
+        peer = _fmt_addr(writer.get_extra_info("peername") or address)
         remote_writer = None
         try:
             try:
@@ -515,11 +679,19 @@ def _port_number(text):
     return value
 
 
+def _env_bytes(text):
+    if sys.platform == "win32":
+        # The environment is UTF-16 there; fsencode would give '?' under PYTHONLEGACYWINDOWSFSENCODING
+        return text.encode("utf-8", "surrogatepass")
+    # os.fsencode gives back exactly the bytes the shell put into the environment
+    return os.fsencode(text)
+
+
 def _parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="proxy.py", description="Minimal SOCKS5 (RFC 1928) CONNECT proxy.",
         epilog="Silent by default. --auth reads the credentials from the environment "
-               "variables SOCKS5_USER and SOCKS5_PASS so they never appear in the process list.")
+               "variables SOCKS5_USER and SOCKS5_PASS so they are not part of the command line.")
     parser.add_argument("--host", default=DEFAULT_HOST,
                         help="address to listen on (default: %(default)s)")
     parser.add_argument("--port", type=_port_number, default=DEFAULT_PORT,
@@ -528,14 +700,14 @@ def _parse_args(argv):
                         help="log connections and errors to stderr (default: no output at all)")
     parser.add_argument("--auth", action="store_true",
                         help="require RFC 1929 username/password authentication (default: off)")
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     args = parser.parse_args(argv)
     args.credentials = None
     user, password = os.environ.get("SOCKS5_USER"), os.environ.get("SOCKS5_PASS")
     if args.auth:
         if not user or not password:
             parser.error("--auth requires SOCKS5_USER and SOCKS5_PASS to be set in the environment")
-        # os.fsencode gives back exactly the bytes the shell put into the environment
-        args.credentials = (os.fsencode(user), os.fsencode(password))
+        args.credentials = (_env_bytes(user), _env_bytes(password))
         if max(len(part) for part in args.credentials) > 255:
             parser.error("SOCKS5_USER and SOCKS5_PASS may be at most 255 bytes each (RFC 1929)")
     elif user or password:
@@ -549,11 +721,24 @@ def _parse_args(argv):
 async def _run(server):
     loop = asyncio.get_event_loop()
     stop = asyncio.Event()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):  # SIGBREAK (Ctrl-Break) exists on Windows only
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
         try:
             loop.add_signal_handler(sig, stop.set)
-        except (NotImplementedError, RuntimeError):
-            pass  # Windows or not the main thread: Ctrl-C then arrives as KeyboardInterrupt
+        except NotImplementedError:  # Windows: the loop has no signal support of its own
+            def handler(signum, frame):
+                try:
+                    loop.call_soon_threadsafe(stop.set)
+                except RuntimeError:  # loop already closed
+                    pass
+            try:
+                signal.signal(sig, handler)
+            except (OSError, ValueError, RuntimeError):  # ValueError: not the main thread
+                pass
+        except RuntimeError:
+            pass  # not the main thread
     await server.start()
     await stop.wait()
 

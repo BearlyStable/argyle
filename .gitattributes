@@ -1,0 +1,2 @@
+# Check out text files with LF on every platform, so the Windows CI tests the same bytes that ship.
+* text=auto eol=lf

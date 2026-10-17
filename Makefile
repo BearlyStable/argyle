@@ -32,8 +32,9 @@ else
 	docker run --rm -v "$$PWD":/w:ro -w /w python:3.6-slim python -m unittest discover -s tests -t .
 endif
 
+# What unittest runs per module, inherited tests included (the README's Tests table).
 counts:
-	@for f in tests/test_*.py; do printf '%-28s %s\n' "$$f" "$$(grep -cE '^[[:space:]]+(async )?def test_' $$f)"; done
+	@$(PY) -B -c "import glob, unittest; n = {f[6:-3]: unittest.defaultTestLoader.loadTestsFromName('tests.' + f[6:-3]).countTestCases() for f in sorted(glob.glob('tests/test_*.py'))}; [print('%-20s %4d' % kv) for kv in sorted(n.items())]; print('%-20s %4d' % ('total', sum(n.values())))"
 
 hooks:
 	git config core.hooksPath .githooks

@@ -356,7 +356,14 @@ async def hang():
 # ---------------------------------------------------------------------------------------------
 
 class IntegrationTestCase(AsyncTestCase):
-    """AsyncTestCase plus proxy, target and client factories whose sockets are always closed."""
+    """AsyncTestCase plus proxy, target and client factories whose sockets are always closed.
+
+    ``OWN_ACCEPT`` picks how the proxies of a test accept connections: None is the platform default
+    (asyncio's server on POSIX, the proxy's own accept loop on Windows), True forces the own accept
+    loop and False asyncio's server. It sets ``server._own_accept`` before ``start()``.
+    """
+
+    OWN_ACCEPT = None
 
     def setUp(self):
         super().setUp()
@@ -387,6 +394,8 @@ class IntegrationTestCase(AsyncTestCase):
     async def start_proxy(self, **kwargs):
         """A Socks5Server on 127.0.0.1 and an ephemeral port (``server.port``)."""
         server = proxy.Socks5Server("127.0.0.1", 0, **kwargs)
+        if self.OWN_ACCEPT is not None:
+            server._own_accept = self.OWN_ACCEPT
         self._proxies.append(server)
         await server.start()
         return server

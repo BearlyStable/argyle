@@ -11,7 +11,9 @@
 * the process exits promptly and with status 0 however signals arrive, and even while a lookup
   is stuck in getaddrinfo().
 * running out of file descriptors (EMFILE on accept) neither kills nor wedges the listener: it serves again
-  as soon as descriptors are free.
+  as soon as descriptors are free,
+* the test harness itself: an ERROR log record fails a test wherever it is emitted (also inside
+  ``assertLogs`` and while leftover tasks are cancelled), and a spinning parser fails instead of hanging.
 
 Standard library only; nothing newer than Python 3.6.
 """
@@ -20,6 +22,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import errno
+import functools
 import io
 import logging
 import os
@@ -30,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import _thread
 import threading
 import time
 import unittest
@@ -41,7 +45,9 @@ try:
 except ImportError:  # pragma: no cover
     resource = None
 
-from tests.support import ROOT, AsyncTestCase, FakeReader, FakeWriter, proxy
+from tests.support import (ROOT, STOP_SIGNAL_PAIRS, WINDOWS, AsyncTestCase, FakeReader, FakeWriter,
+                           popen_kwargs, proxy, scaled, send_late_signal, send_stop,
+                           signal_name, stop_signals_of_this_process)
 
 PROXY_PY = os.path.join(ROOT, "proxy.py")
 
@@ -176,12 +182,15 @@ class ShutdownTests(AsyncTestCase):
                 else:
                     loop.call_soon(hop, n - 1)
 
-            async def stub_open_connection(host, port, **kwargs):
+            real_open = asyncio.open_connection
+
+            async def stub_open_connection(host=None, port=None, **kwargs):
+                if "sock" in kwargs:  # an accepted client socket (the own accept loop, Windows): real streams
+                    return await real_open(**kwargs)
                 loop.call_soon(hop, hops)
                 await asyncio.sleep(0)  # the connect "finishes" here...
                 return BlockingReader(), FakeRemoteWriter()  # ...and the relay would block forever
 
-            real_open = asyncio.open_connection
             with mock.patch("asyncio.open_connection", stub_open_connection):
                 reader, writer = await real_open("127.0.0.1", server.port)
                 writer.write(b"\x05\x01\x00" + connect_request("192.0.2.1", 9))
@@ -512,10 +521,11 @@ def clean_env(**extra):
     return env
 
 
-def run_proxy(args, env=None, timeout=20):
+def run_proxy(args, env=None, timeout=scaled(20)):
     """Run proxy.py to completion; returns (returncode, stdout, stderr)."""
     process = subprocess.Popen([sys.executable, PROXY_PY] + args, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env or clean_env())
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env or clean_env(),
+                               **popen_kwargs())
     try:
         out, err = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -532,10 +542,14 @@ class Running(object):
         self.port = free_port()
         self.process = subprocess.Popen(
             [sys.executable, PROXY_PY, "--port", str(self.port)] + list(args), stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env or clean_env())
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env or clean_env(), **popen_kwargs())
+
+    def stop(self, sig=None):
+        """Send the platform's graceful stop (SIGTERM; CTRL_BREAK_EVENT on Windows) or ``sig``."""
+        send_stop(self.process, sig)
 
     def __enter__(self):
-        deadline = time.time() + 10
+        deadline = time.time() + scaled(10)
         while time.time() < deadline:
             try:
                 socket.create_connection(("127.0.0.1", self.port), timeout=0.2).close()
@@ -576,10 +590,20 @@ class StartupErrorTests(unittest.TestCase):
         self.assertNotIn(b"Traceback", err)
 
 
-class MainInProcessTests(unittest.TestCase):
-    """proxy.main() run inside the test process; the global state it changes is restored afterwards."""
+class InProcessMainCase(unittest.TestCase):
+    """Base for the tests that run proxy.main() inside the test process.
+
+    main() changes global state: the current event loop, logging, warning filters and, because it
+    leaves its loop open on purpose, signal handlers. All of it is put back afterwards. Windows (and a
+    loop without ``add_signal_handler``) uses ``signal.signal`` handlers, which unlike the loop's own
+    survive ``loop.close()``; left in place they would call into a dead loop in whatever test runs next.
+    """
 
     def setUp(self):
+        # Registered first, so it runs last: after the loops are closed (which give SIGINT/SIGTERM back
+        # their defaults on POSIX), the handlers the process had before the test are put back.
+        self.addCleanup(self._restore_signal_handlers, {
+            sig: signal.getsignal(sig) for sig in stop_signals_of_this_process()})
         self.addCleanup(logging.disable, logging.NOTSET)
         catcher = warnings.catch_warnings()
         catcher.__enter__()
@@ -589,8 +613,10 @@ class MainInProcessTests(unittest.TestCase):
         real_new_event_loop = asyncio.new_event_loop
 
         def spy():
-            self.loops.append(real_new_event_loop())
-            return self.loops[-1]
+            loop = real_new_event_loop()
+            self.loops.append(loop)
+            self.prepare_loop(loop)
+            return loop
         patcher = mock.patch("asyncio.new_event_loop", spy)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -598,11 +624,22 @@ class MainInProcessTests(unittest.TestCase):
         # SIGTERM back their default handlers. Runs before the cleanups registered above.
         self.addCleanup(lambda: [loop.close() for loop in self.loops])
 
+    @staticmethod
+    def _restore_signal_handlers(saved):
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+
+    def prepare_loop(self, loop):
+        """Hook: change the loop main() is about to use."""
+
     def run_main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             status = proxy.main(list(argv))
         return status, out.getvalue(), err.getvalue()
+
+
+class MainInProcessTests(InProcessMainCase):
 
     def test_an_unexpected_startup_error_exits_1_silently(self):
         """Any exception while starting, not just OSError/ValueError, is a silent exit status 1."""
@@ -612,14 +649,157 @@ class MainInProcessTests(unittest.TestCase):
     def test_the_loop_and_its_signal_handlers_are_still_in_place_when_main_returns(self):
         """Closing the loop removes its signal handlers one by one, and a second signal in that moment
         kills the process or prints a traceback; so main() leaves them for the exit that follows."""
-        timer = threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGINT))  # SIGINT: safe even if unhandled
+        if WINDOWS:
+            # os.kill(os.getpid(), SIGINT) is TerminateProcess on Windows: it would end the test runner.
+            interrupt = _thread.interrupt_main  # a simulated SIGINT: runs the Python-level handler
+        else:
+            interrupt = functools.partial(os.kill, os.getpid(), signal.SIGINT)  # safe even if unhandled
+        timer = threading.Timer(0.5, interrupt)
         timer.start()
         self.addCleanup(timer.cancel)
         self.assertEqual(self.run_main("--port", "0"), (0, "", ""))
         loop = self.loops[0]
         self.assertFalse(loop.is_closed())
+        if WINDOWS:  # no add_signal_handler there: signal.signal() handlers of the proxy's own are installed
+            for sig in stop_signals_of_this_process():
+                handler = signal.getsignal(sig)
+                self.assertTrue(callable(handler) and handler is not signal.default_int_handler,
+                                "%s has handler %r" % (signal_name(sig), handler))
+        else:
+            self.assertIsNot(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+            self.assertNotEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+
+class SignalFallbackTests(InProcessMainCase):
+    """Where the loop has no ``add_signal_handler`` (every loop on Windows) the proxy uses ``signal.signal``.
+
+    The loop main() gets is made to raise NotImplementedError from ``add_signal_handler``, as the
+    Proactor loop does, so this exercises the fallback on Linux too. main() runs in the test's main
+    thread, as it must for signals; a second thread waits until the server is up and then sends
+    the signal. A SIGINT that the proxy has not taken over would be a KeyboardInterrupt out of main(),
+    and SIGTERM would end the whole test run, so SIGTERM is caught by a recorder first: a proxy that
+    forgets to install its handler then fails the test instead of killing the runner.
+    """
+
+    DEADLINE = 2.0  # seconds from the signal to main() returning; passing runs take a few milliseconds
+
+    def prepare_loop(self, loop):
+        def add_signal_handler(sig, callback, *args):
+            raise NotImplementedError("this loop has no signal support")
+        loop.add_signal_handler = add_signal_handler
+
+    def setUp(self):
+        InProcessMainCase.setUp(self)
+        self.leaked = []  # signals that reached the test's own recorder: the proxy did not handle them
+        self.started = threading.Event()
+        self.signalled_at = []
+        real_start = proxy.Socks5Server.start
+        test = self
+
+        async def start(server):
+            await real_start(server)
+            test.started.set()
+
+        patcher = mock.patch.object(proxy.Socks5Server, "start", start)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("SIGTERM", "SIGBREAK"):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), lambda signum, frame: self.leaked.append(signum))
+
+    @staticmethod
+    def deliver(sig):
+        """Send ``sig`` to this process, to its main thread (where the Python-level handler runs)."""
+        if not WINDOWS:
+            # A real signal: it interrupts the main thread's select() and the handler then wakes the loop
+            # up. pthread_kill() rather than os.kill(): the kernel may give a process-wide signal to
+            # any thread, and one that lands on the sender leaves the main thread asleep in select().
+            signal.pthread_kill(threading.main_thread().ident, sig)
+        elif sig == signal.SIGINT:
+            _thread.interrupt_main()  # os.kill(getpid(), SIGINT) would be TerminateProcess here
+        else:
+            signal.raise_signal(sig)  # runs the C-level handler (CRT raise()); Python 3.8+, as is Windows support
+
+    def signal_when_started(self, sig):
+        """From a thread: wait until the server listens, then deliver ``sig``. A watchdog gets main()
+        out of a run that never ends, so a broken proxy fails the test instead of hanging the suite."""
+        def run():
+            if not self.started.wait(10):
+                self.deliver(signal.SIGINT)
+                return
+            self.signalled_at.append(time.monotonic())
+            self.deliver(sig)
+        thread = threading.Thread(target=run)
+        thread.daemon = True
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        # A real signal (not interrupt_main(), which cannot wake a main thread asleep in select()).
+        watchdog = threading.Timer(15, self.deliver, (signal.SIGINT,))
+        watchdog.start()
+        self.addCleanup(watchdog.cancel)
+
+    def run_and_time(self):
+        try:
+            result = self.run_main("--port", "0")
+        except KeyboardInterrupt:  # as an exception it would abort the whole test run, not fail one test
+            self.fail("KeyboardInterrupt escaped from main(): a signal was not handled by the proxy")
+        self.assertTrue(self.signalled_at, "the proxy never started listening")
+        elapsed = time.monotonic() - self.signalled_at[0]
+        self.assertEqual(self.leaked, [], "the signal reached the test's recorder: the proxy had not taken it over")
+        self.assertEqual(result, (0, "", ""))
+        self.assertLess(elapsed, self.DEADLINE)
+
+    def test_sigint_stops_the_proxy_cleanly_and_silently(self):
+        """The signal fallback: SIGINT ends main() with status 0, no output, no KeyboardInterrupt, at once;
+        the handler stays installed (a second Ctrl-C after main() returns finds a handler, not the default)."""
+        self.signal_when_started(signal.SIGINT)
+        self.run_and_time()
+        self.assertFalse(self.loops[0].is_closed())
         self.assertIsNot(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
+    @unittest.skipIf(WINDOWS, "SIGTERM cannot be raised at the main thread from another thread on Windows; "
+                              "Ctrl-Break (SIGBREAK) is the Windows counterpart, tested separately")
+    def test_sigterm_stops_the_proxy_cleanly_and_silently(self):
+        """The signal fallback: SIGTERM ends main() with status 0 and no output, within 2 s."""
+        self.signal_when_started(signal.SIGTERM)
+        self.run_and_time()
         self.assertNotEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    @unittest.skipUnless(hasattr(signal, "SIGBREAK"), "SIGBREAK (Ctrl-Break) exists on Windows only")
+    def test_sigbreak_stops_the_proxy_cleanly_and_silently(self):
+        """The signal fallback: Ctrl-Break (SIGBREAK) ends main() with status 0 and no output, within 2 s."""
+        self.signal_when_started(signal.SIGBREAK)
+        self.run_and_time()
+
+    def second_signal_during_shutdown(self, first, second):
+        """Deliver ``second`` from inside stop(), that is while main() shuts down, deterministically."""
+        real_stop = proxy.Socks5Server.stop
+        delivered = []
+
+        async def stop(server):
+            delivered.append(second)
+            self.deliver(second)  # handled in this thread at the next bytecode boundary
+            await asyncio.sleep(0)
+            await real_stop(server)
+
+        with mock.patch.object(proxy.Socks5Server, "stop", stop):
+            self.signal_when_started(first)
+            self.run_and_time()
+        self.assertEqual(delivered, [second])
+
+    def test_a_second_sigint_during_shutdown_changes_nothing(self):
+        """A second Ctrl-C while the proxy shuts down is harmless: status 0, no KeyboardInterrupt, no output."""
+        self.second_signal_during_shutdown(signal.SIGINT, signal.SIGINT)
+
+    @unittest.skipIf(WINDOWS, "see test_sigterm_stops_the_proxy_cleanly_and_silently")
+    def test_a_second_sigterm_during_shutdown_changes_nothing(self):
+        """A second SIGTERM while the proxy shuts down is harmless: status 0 and no output."""
+        self.second_signal_during_shutdown(signal.SIGTERM, signal.SIGTERM)
+
+    @unittest.skipIf(WINDOWS, "see test_sigterm_stops_the_proxy_cleanly_and_silently")
+    def test_sigint_after_sigterm_during_shutdown_changes_nothing(self):
+        """SIGTERM then Ctrl-C while shutting down: status 0 and no output."""
+        self.second_signal_during_shutdown(signal.SIGTERM, signal.SIGINT)
 
 
 class CredentialTests(unittest.TestCase):
@@ -692,16 +872,15 @@ class ShutdownProcessTests(unittest.TestCase):
         self.addCleanup(thread.join, 5)
         self.addCleanup(stop.set)
 
-        for first, second in ((signal.SIGTERM, signal.SIGINT), (signal.SIGINT, signal.SIGINT),
-                              (signal.SIGTERM, signal.SIGTERM)):
-            with self.subTest(signals=(first.name, second.name)):
+        for first, second in STOP_SIGNAL_PAIRS:
+            with self.subTest(signals=(signal_name(first), signal_name(second))):
                 with Running() as running:
                     self._open_connections(running.port, target.getsockname()[1])
                     started = time.time()
-                    running.process.send_signal(first)
+                    running.stop(first)
                     time.sleep(0.05)
-                    running.process.send_signal(second)
-                    out, err = running.process.communicate(timeout=10)
+                    send_late_signal(running.process, second)  # the group may be gone by now
+                    out, err = running.process.communicate(timeout=scaled(10))
                     self.assertEqual((running.process.returncode, out, err), (0, b"", b""))
                     self.assertLess(time.time() - started, 3.0)
 
@@ -709,17 +888,18 @@ class ShutdownProcessTests(unittest.TestCase):
         """A second signal while the process shuts down must change nothing: no status -15/-2, no
         traceback, no 'Exception ignored when trying to write to the signal wakeup fd'. The risky
         moments are a few milliseconds after the first signal, so probe those, several times."""
-        for first, second in ((signal.SIGTERM, signal.SIGTERM), (signal.SIGINT, signal.SIGINT)):
+        pairs = [pair for pair in STOP_SIGNAL_PAIRS if pair[0] == pair[1]]  # (SIGTERM, SIGTERM), (SIGINT, SIGINT)
+        for first, second in pairs:
             for delay in (0.001, 0.002, 0.003, 0.005, 0.02):
                 for attempt in (1, 2):
-                    with self.subTest(signals=(first.name, second.name), delay=delay, attempt=attempt):
+                    with self.subTest(signals=(signal_name(first), signal_name(second)), delay=delay,
+                                      attempt=attempt):
                         with Running() as running:
                             self._open_connections(running.port, 0, established=0, half_open=3)
-                            running.process.send_signal(first)
+                            running.stop(first)
                             time.sleep(delay)
-                            if running.process.poll() is None:
-                                running.process.send_signal(second)
-                            out, err = running.process.communicate(timeout=10)
+                            send_late_signal(running.process, second)  # the group may be gone by now
+                            out, err = running.process.communicate(timeout=scaled(10))
                             self.assertEqual((running.process.returncode, out, err), (0, b"", b""))
 
     def test_exit_is_not_held_up_by_a_resolver_thread_that_never_returns(self):
@@ -746,8 +926,8 @@ class ShutdownProcessTests(unittest.TestCase):
             sock.sendall(b"\x05\x01\x00\x03" + bytes((len(name),)) + name + (80).to_bytes(2, "big"))
             time.sleep(0.5)  # the proxy is now inside getaddrinfo() on a worker thread
             started = time.time()
-            running.process.send_signal(signal.SIGTERM)
-            out, err = running.process.communicate(timeout=20)
+            running.stop()
+            out, err = running.process.communicate(timeout=scaled(20))
             self.assertEqual((running.process.returncode, out, err), (0, b"", b""))
             self.assertLess(time.time() - started, 5.0)
 
@@ -778,8 +958,8 @@ class ShutdownProcessTests(unittest.TestCase):
                 sock.sendall(connect_request("127.0.0.1", target_port))  # proxy now hangs in connect()
                 clients.append(sock)
             time.sleep(0.4)
-            running.process.send_signal(signal.SIGTERM)
-            out, err = running.process.communicate(timeout=10)
+            running.stop()
+            out, err = running.process.communicate(timeout=scaled(10))
             self.assertEqual((running.process.returncode, out, err), (0, b"", b""))
 
 
@@ -791,9 +971,13 @@ class ShutdownProcessTests(unittest.TestCase):
 class DescriptorExhaustionTests(unittest.TestCase):
     """When accept() fails with EMFILE, asyncio pauses the listener and retries once a second.
 
-    What this pins down is that the proxy neither dies nor keeps the descriptors it already
+    proxy.py has no EMFILE code of its own: what this pins down is asyncio's pause-and-retry behaviour
+    as the proxy uses it, and that the proxy neither dies nor keeps the descriptors it already
     accepted once those clients are gone, so it serves again by itself. Silent mode: there is
     nothing on stderr to flood.
+
+    Limit: garbage collection can close a leaked socket and so mask a missing explicit close
+    here; the tests that watch descriptors and transports directly (test_integration) catch that.
     """
 
     LIMIT = 40  # descriptors the proxy may have open (about 7 are its own)
@@ -827,9 +1011,132 @@ class DescriptorExhaustionTests(unittest.TestCase):
             while not self.greeting_answered(running.port, 1.0):
                 self.assertIsNone(running.process.poll(), "the proxy exited while out of descriptors")
                 self.assertLess(time.time(), deadline, "the proxy never served again after the clients left")
-            running.process.send_signal(signal.SIGTERM)
+            running.stop()
             out, err = running.process.communicate(timeout=10)
             self.assertEqual((running.process.returncode, out, err), (0, b"", b""))
+
+
+# --------------------------------------------------------------------------- the harness itself
+
+def run_inner(test_class, name):
+    """Run one test of ``test_class`` (defined inside a test, so discovery never sees it) and return the result."""
+    result = unittest.TestResult()
+    test_class(name).run(result)
+    return result
+
+
+class HarnessTests(unittest.TestCase):
+    """AsyncTestCase must not let an ERROR log record go unnoticed (the proxy logs "unexpected error"
+    where a bug would otherwise look like an ordinary disconnect)."""
+
+    def assertFailsBecauseOfErrorRecord(self, result, text):
+        self.assertEqual(result.errors, [])
+        self.assertEqual(len(result.failures), 1, "the inner test passed: the ERROR record went unnoticed")
+        self.assertIn("ERROR-level log records", result.failures[0][1])
+        self.assertIn(text, result.failures[0][1])
+
+    def test_an_error_record_during_the_test_fails_it(self):  # control for the cases below
+        class Inner(AsyncTestCase):
+            def scenario_it(self):
+                logging.getLogger("socks5").error("from the body")
+
+        self.assertFailsBecauseOfErrorRecord(run_inner(Inner, "scenario_it"), "from the body")
+
+    def test_an_error_record_while_leftover_tasks_are_cancelled_fails_the_test(self):
+        class Inner(AsyncTestCase):
+            def scenario_it(self):
+                async def leftover():
+                    try:
+                        await asyncio.sleep(3600)
+                    except asyncio.CancelledError:
+                        logging.getLogger("socks5").error("from the drain")
+                        raise
+                asyncio.ensure_future(leftover(), loop=self.loop)
+                self.run_async(asyncio.sleep(0))  # the test ends with the task still pending
+
+        self.assertFailsBecauseOfErrorRecord(run_inner(Inner, "scenario_it"), "from the drain")
+
+    def test_an_error_record_inside_assert_logs_fails_the_test(self):
+        class Inner(AsyncTestCase):
+            def scenario_by_name(self):
+                with self.assertLogs("socks5", level="INFO"):
+                    logging.getLogger("socks5").info("expected")
+                    logging.getLogger("socks5").error("hidden by assertLogs")
+
+            def scenario_default_level(self):
+                with self.assertLogs("socks5"):
+                    logging.getLogger("socks5").error("hidden at the default level")
+
+            def scenario_child_logger(self):
+                with self.assertLogs("socks5", level="INFO"):
+                    logging.getLogger("socks5.child").error("hidden in a child logger")
+
+            def scenario_logger_object(self):
+                with self.assertLogs(logging.getLogger("socks5"), level="WARNING"):
+                    logging.getLogger("socks5").error("hidden, logger passed as an object")
+
+        for name, text in (("scenario_by_name", "hidden by assertLogs"),
+                           ("scenario_default_level", "hidden at the default level"),
+                           ("scenario_child_logger", "hidden in a child logger"),
+                           ("scenario_logger_object", "hidden, logger passed as an object")):
+            with self.subTest(name):
+                self.assertFailsBecauseOfErrorRecord(run_inner(Inner, name), text)
+
+    def test_assert_logs_asking_for_error_level_expects_the_error(self):
+        class Inner(AsyncTestCase):
+            def scenario_it(self):
+                with self.assertLogs("socks5", level="ERROR") as captured:
+                    logging.getLogger("socks5").error("expected")
+                self.assertEqual([r.getMessage() for r in captured.records], ["expected"])
+
+            def scenario_numeric(self):
+                with self.assertLogs("socks5", level=logging.CRITICAL):
+                    logging.getLogger("socks5").critical("expected")
+
+        for name in ("scenario_it", "scenario_numeric"):
+            with self.subTest(name):
+                result = run_inner(Inner, name)
+                self.assertEqual((result.errors, result.failures), ([], []))
+
+    def test_assert_logs_still_captures_and_still_complains_about_silence(self):
+        class Inner(AsyncTestCase):
+            def scenario_captures(self):
+                with self.assertLogs("socks5", level="INFO") as captured:
+                    logging.getLogger("socks5").info("hello")
+                    logging.getLogger("socks5").warning("careful")
+                self.assertEqual(captured.output, ["INFO:socks5:hello", "WARNING:socks5:careful"])
+
+            def scenario_nothing_logged(self):
+                with self.assertLogs("socks5", level="INFO"):
+                    pass
+
+        self.assertEqual(run_inner(Inner, "scenario_captures").failures, [])
+        self.assertEqual(len(run_inner(Inner, "scenario_nothing_logged").failures), 1)
+
+    def test_the_collector_is_gone_after_the_test(self):
+        before = list(logging.getLogger().handlers)
+
+        class Inner(AsyncTestCase):
+            def scenario_it(self):
+                with self.assertLogs("socks5", level="INFO"):
+                    logging.getLogger("socks5").info("x")
+
+        run_inner(Inner, "scenario_it")
+        self.assertEqual(logging.getLogger().handlers, before)
+        self.assertEqual(logging.getLogger("socks5").handlers, [])
+
+    def test_a_reader_that_is_read_without_end_fails_instead_of_hanging(self):
+        async def spin(reader):
+            while True:
+                await reader.read(1)
+
+        reader = FakeReader(b"")
+        coroutine = spin(reader)
+        with self.assertRaises(AssertionError) as caught:
+            coroutine.send(None)
+        coroutine.close()
+        self.assertIn("spinning", str(caught.exception))
+        self.assertEqual(len(reader.reads), FakeReader.MAX_CALLS + 1)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import gc
 import hashlib
 import os
 import socket
+import sys
 import unittest
 from unittest import mock
 
@@ -316,6 +317,51 @@ class ErrorReplyTests(IntegrationTestCase):
                 self.assertEqual(await read_all(reader), error_reply(8))
                 writer.close()
         await self.check_echo(server, target)
+
+    @async_test(timeout=40)  # room for every case to hit its own 2 s EOF bound when the proxy is broken
+    async def test_every_error_reply_is_followed_by_eof_within_the_rfc_limit(self):
+        """RFC 1928 section 6: after a non-zero REP the server terminates the connection (within 10 s).
+
+        Each failing path gets its exact reply bytes, then a clean EOF with nothing after them. The
+        bound is 2 s: far under the RFC's 10 s, and under the 15 s handshake timeout that would
+        otherwise be the only thing ending a connection the proxy forgot to close.
+        """
+        target = await self.start_target(echo)
+        server = await self.start_proxy(connect_timeout=0.3)  # only the timeout case needs this short
+        refusing_server = await self.start_proxy()  # a refusal must not race a short connect timeout
+        auth_server = await self.start_proxy(credentials=(b"user", b"pass"))
+        hung = self.fault_connects(hang)
+        wrong_version = bytes.fromhex("04 01 00 01 7f000001 0050")
+        # (label, proxy, methods offered, expected method answer, bytes sent next, expected reply)
+        cases = [
+            ("no acceptable method (05 ff)", server, (2,), b"\x05\xff", b"", b""),
+            ("RFC 1929 failure (01 01)", auth_server, (2,), b"\x05\x02",
+             auth_message(b"user", b"wrong"), b"\x01\x01"),
+            ("wrong request version (REP 01)", server, (0,), b"\x05\x00", wrong_version, error_reply(1)),
+            ("unsupported command (REP 07)", server, (0,), b"\x05\x00",
+             connect_request("127.0.0.1", target.port, cmd=0x02), error_reply(7)),
+            ("unknown address type (REP 08)", server, (0,), b"\x05\x00",
+             build_request(1, 0x09, b"\x00" * 4, target.port), error_reply(8)),
+            ("empty domain name (REP 04)", server, (0,), b"\x05\x00",
+             build_request(1, 3, b"\x00", target.port), error_reply(4)),
+            ("domain name with a control character (REP 04)", server, (0,), b"\x05\x00",
+             build_request(1, 3, b"\x0a127.0.0.1\n", target.port), error_reply(4)),
+            ("connection refused (REP 05)", refusing_server, (0,), b"\x05\x00",
+             connect_request("127.0.0.1", free_port()), error_reply(5)),
+            ("connect timeout (REP 06)", server, (0,), b"\x05\x00",
+             connect_request("127.0.0.1", hung), error_reply(6)),
+        ]
+        for label, which, methods, method_answer, message, expected in cases:
+            with self.subTest(label):
+                reader, writer = await self.open_client(which)
+                self.assertEqual(await greet(reader, writer, methods), method_answer)
+                if message:
+                    writer.write(message)
+                got = await asyncio.wait_for(reader.readexactly(len(expected)), 5)
+                self.assertEqual(got, expected)
+                self.assertEqual(await read_all(reader, timeout=2), b"")  # EOF, nothing after the reply
+                writer.close()
+        self.assertEqual(target.connections, [])  # none of the refused requests reached the target
 
 
 class MalformedInputTests(IntegrationTestCase):
@@ -689,6 +735,32 @@ class AuthTests(IntegrationTestCase):
         self.assertEqual(target.connections, [])
 
     @async_test
+    async def test_zero_length_username_or_password_on_the_wire_gets_01_01_and_a_close(self):
+        """RFC 1929 wants ULEN and PLEN in 1..255; a zero is read, refused with ``01 01``, then EOF."""
+        target = await self.start_target(echo)
+        server = await self.start_proxy(credentials=(b"user", b"pass"))
+        attempts = [  # literal wire bytes: VER ULEN UNAME PLEN PASSWD
+            ("ULEN=0, real-looking password", bytes.fromhex("01 00 04 70617373")),
+            ("PLEN=0, real-looking username", bytes.fromhex("01 04 75736572 00")),
+            ("ULEN=0 and PLEN=0", bytes.fromhex("01 00 00")),
+        ]
+        for label, message in attempts:
+            with self.subTest(label):
+                reader, writer = await self.open_client(server)
+                self.assertEqual(await greet(reader, writer, (2,)), b"\x05\x02")
+                writer.write(message)
+                self.assertEqual(await asyncio.wait_for(reader.readexactly(2), 5), b"\x01\x01")
+                self.assertEqual(await read_all(reader, timeout=2), b"")  # then EOF, nothing more
+                writer.close()
+        self.assertEqual(target.connections, [])
+        # the refusals did not wedge anything: the right credentials still get through
+        reader, writer = await self.open_client(server)
+        self.assertEqual(await greet(reader, writer, (2,)), b"\x05\x02")
+        writer.write(auth_message(b"user", b"pass") + connect_request("127.0.0.1", target.port))
+        self.assertEqual(await asyncio.wait_for(reader.readexactly(2), 5), b"\x01\x00")
+        self.assertEqual((await read_reply(reader)).rep, 0)
+
+    @async_test
     async def test_no_authentication_offer_is_refused_by_an_authenticating_proxy(self):
         """A client offering only 'no authentication' gets ``05 ff`` when credentials are required."""
         server = await self.start_proxy(credentials=(b"user", b"pass"))
@@ -722,22 +794,36 @@ class AuthTests(IntegrationTestCase):
 
 class ConcurrencyTests(IntegrationTestCase):
 
-    @async_test(timeout=30)
+    @async_test(timeout=90)
     async def test_many_concurrent_clients(self):
-        """60 simultaneous clients each get their own correct echo; no task is left afterwards."""
+        """60 simultaneous clients each get their own correct echo; no task is left afterwards.
+
+        Proxy, target and all 60 clients share one event loop (under ``-X dev`` on a busy machine the
+        run takes 15 s), so the time limit is one generous overall deadline that every wait draws on,
+        not a few seconds per client. A client that is never answered still fails the test, and so
+        does an echo that is not its own.
+        """
         target = await self.start_target(echo)
         server = await self.start_proxy()
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 60
+
+        def remaining():
+            return max(deadline - loop.time(), 0.1)
 
         async def client(number):
-            reader, writer, reply = await self.socks_connect(server, "127.0.0.1", target.port)
+            reader, writer = await self.open_client(server)
+            self.assertEqual(await greet(reader, writer, timeout=remaining()), b"\x05\x00")
+            writer.write(connect_request("127.0.0.1", target.port))
+            reply = await read_reply(reader, timeout=remaining())
             self.assertEqual(reply.rep, 0)
             message = ("client-%03d;" % number).encode() * 40
             writer.write(message)
-            self.assertEqual(await asyncio.wait_for(reader.readexactly(len(message)), 15), message)
+            self.assertEqual(await asyncio.wait_for(reader.readexactly(len(message)), remaining()), message)
             writer.close()
 
-        await asyncio.wait_for(asyncio.gather(*[client(n) for n in range(60)]), 25)
-        await wait_until(lambda: server.active_connections == 0, what="all tasks to end")
+        await asyncio.wait_for(asyncio.gather(*[client(n) for n in range(60)]), remaining())
+        await wait_until(lambda: server.active_connections == 0, timeout=remaining(), what="all tasks to end")
         self.assertEqual(len(target.connections), 60)
 
 
@@ -762,6 +848,72 @@ class LoggingTests(IntegrationTestCase):
                         messages)
         self.assertTrue(any("127.0.0.1:%d" % refused in m and "0x05" in m for m in messages), messages)
         self.assertEqual([m for r, m in zip(captured.records, messages) if r.levelno >= 30], [])
+
+
+# ---------------------------------------------------------------------------------------------
+# The other accept path. Windows runs the proxy's own accept loop by default, everything else
+# asyncio's server (see proxy._OWN_ACCEPT). These subclasses re-run a representative set of the
+# classes above through the path the platform does NOT use by default, so Linux CI exercises the
+# Windows code and a Windows run still covers asyncio's server. They add about 10 s.
+# ---------------------------------------------------------------------------------------------
+
+OTHER_ACCEPT_PATH = sys.platform != "win32"  # value of server._own_accept for the subclasses below
+
+
+class OtherAcceptPathChecks(object):
+    """Mixed into the subclasses: proves the forced path is really the one that is running."""
+
+    OWN_ACCEPT = OTHER_ACCEPT_PATH
+
+    @async_test
+    async def test_the_forced_accept_path_is_the_one_in_use(self):
+        """Guards the seam: if ``_own_accept`` stopped being honoured these subclasses would only
+        repeat the base classes' tests and prove nothing."""
+        server = await self.start_proxy()
+        self.assertIs(server._own_accept, OTHER_ACCEPT_PATH)
+        if OTHER_ACCEPT_PATH:
+            self.assertIsNone(server._server)
+            self.assertEqual(len(server._sockets), 1)
+            self.assertEqual(len(server._accept_tasks), 1)
+        else:
+            self.assertEqual(server._sockets, [])
+            self.assertIsNotNone(server._server)
+
+
+class OtherAcceptConnectTests(OtherAcceptPathChecks, ConnectTests):
+    pass
+
+
+class OtherAcceptForwardingTests(OtherAcceptPathChecks, ForwardingTests):
+    pass
+
+
+class OtherAcceptErrorReplyTests(OtherAcceptPathChecks, ErrorReplyTests):
+    pass
+
+
+class OtherAcceptMalformedInputTests(OtherAcceptPathChecks, MalformedInputTests):
+    pass
+
+
+class OtherAcceptTimeoutTests(OtherAcceptPathChecks, TimeoutTests):
+    pass
+
+
+class OtherAcceptDisconnectTests(OtherAcceptPathChecks, DisconnectTests):
+    pass
+
+
+class OtherAcceptShutdownTests(OtherAcceptPathChecks, ShutdownTests):
+    pass
+
+
+class OtherAcceptAuthTests(OtherAcceptPathChecks, AuthTests):
+    pass
+
+
+class OtherAcceptConcurrencyTests(OtherAcceptPathChecks, ConcurrencyTests):
+    pass
 
 
 if __name__ == "__main__":

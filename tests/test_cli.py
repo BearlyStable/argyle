@@ -22,13 +22,15 @@ import threading
 import time
 import unittest
 
-from tests.support import ROOT
+from tests.support import ROOT, WINDOWS, popen_kwargs, proxy as proxy_module, scaled, send_stop
 
-if sys.platform == "win32":
-    raise unittest.SkipTest("these tests rely on POSIX signals")
+# What cannot work on Windows (the rest of this module runs there too):
+SIGINT_NOT_DELIVERABLE = ("Windows cannot deliver SIGINT to a child that is the leader of its own process "
+                          "group (the one CTRL_BREAK_EVENT needs; Ctrl-C is disabled in such a group); the "
+                          "Ctrl-C path is covered in-process by test_hardening.SignalFallbackTests")
 
 PROXY_PY = os.path.join(ROOT, "proxy.py")
-DEADLINE = 10.0  # seconds any single wait may take; passing tests finish in milliseconds
+DEADLINE = scaled(10.0)  # seconds any single wait may take; passing tests finish in milliseconds
 
 ATYP_IPV4, ATYP_DOMAIN = 0x01, 0x03
 REFUSED_REPLY = b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00"  # REP 05, BND.ADDR 0.0.0.0:0
@@ -65,7 +67,7 @@ class ProxyProcess(object):
         command = [sys.executable] + list(python_args) + [script] + list(args)
         self.proc = subprocess.Popen(
             command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=child_env() if env is None else env, cwd=cwd)
+            env=child_env() if env is None else env, cwd=cwd, **popen_kwargs())
         self._out, self._err = bytearray(), bytearray()
         self._readers = [self._start_reader(self.proc.stdout, self._out),
                          self._start_reader(self.proc.stderr, self._err)]
@@ -159,9 +161,10 @@ class ProxyProcess(object):
         self._join_readers()
         return self.proc.returncode, self.stdout, self.stderr
 
-    def stop(self, sig=signal.SIGTERM, timeout=DEADLINE):
-        """Send ``sig``, wait for the exit; returns ``(status, stdout, stderr)``."""
-        self.proc.send_signal(sig)
+    def stop(self, sig=None, timeout=DEADLINE):
+        """Send ``sig`` (default: SIGTERM, or CTRL_BREAK_EVENT on Windows), wait for the exit;
+        returns ``(status, stdout, stderr)``."""
+        send_stop(self.proc, sig)
         return self.wait_exit(timeout)
 
     def close(self):
@@ -310,6 +313,11 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(recv_exact(sock, len(payload)), payload)
 
 
+def lines(data):
+    """Child output as text with Windows line ends normalised (a text-mode pipe writes \\r\\n there)."""
+    return data.decode("utf-8").replace("\r\n", "\n")
+
+
 class HelpTests(CliTestCase):
 
     def run_help(self, **kwargs):
@@ -384,7 +392,7 @@ def exercise_every_path(test, proxy_port, echo_port):
 
 class SilentByDefaultTests(CliTestCase):
 
-    def run_scenario(self, python_args=(), sig=signal.SIGTERM):
+    def run_scenario(self, python_args=(), sig=None):
         echo = self.start_echo_server()
         port = free_port()
         proxy = self.start_proxy("--port", str(port), python_args=python_args)
@@ -393,13 +401,15 @@ class SilentByDefaultTests(CliTestCase):
         return proxy.stop(sig)
 
     def test_default_mode_prints_nothing_and_exits_0_on_sigterm(self):
-        """CLI: without --verbose stdout and stderr stay empty, whatever the clients do."""
+        """CLI: without --verbose stdout and stderr stay empty, whatever the clients do; SIGTERM
+        (Ctrl-Break on Windows) ends it with status 0."""
         self.assertEqual(self.run_scenario(), (0, b"", b""))
 
     def test_python_warnings_cannot_leak_into_default_mode(self):
         """CLI: silent even with warnings enabled ('-X dev -W default'), no ResourceWarning/DeprecationWarning."""
         self.assertEqual(self.run_scenario(python_args=WARNINGS_VISIBLE), (0, b"", b""))
 
+    @unittest.skipIf(WINDOWS, SIGINT_NOT_DELIVERABLE)
     def test_sigint_also_stops_cleanly_and_silently(self):
         """CLI: Ctrl-C (SIGINT) is a clean shutdown: exit status 0, no traceback, no output."""
         self.assertEqual(self.run_scenario(sig=signal.SIGINT), (0, b"", b""))
@@ -501,6 +511,39 @@ class BindTests(CliTestCase):
         self.assertNotIn(b"WARNING", err)  # ::1 is loopback
 
 
+class VersionTests(CliTestCase):
+    """--version prints "proxy.py <version>" to stdout and exits 0 without starting anything."""
+
+    def assert_version(self, proc):
+        status, out, err = proc.wait_exit()
+        self.assertEqual((status, lines(out), err), (0, "proxy.py %s\n" % proxy_module.__version__, b""))
+
+    def test_version_is_printed_to_stdout_and_exits_0(self):
+        """CLI: --version prints 'proxy.py <__version__>' on stdout, nothing on stderr, exit status 0."""
+        self.assertRegex(proxy_module.__version__, r"^\d+\.\d+\.\d+$")
+        self.assert_version(self.start_proxy("--version"))
+
+    def test_version_returns_at_once_and_nothing_listens(self):
+        """CLI: --version with --port N exits by itself and never opens the port."""
+        port = free_port()
+        proc = self.start_proxy("--port", str(port), "--version")
+        self.assert_version(proc)
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+
+    def test_version_wins_over_the_credential_checks(self):
+        """CLI: --version exits 0 even where the same line without it is a usage error (status 2)."""
+        self.assert_version(self.start_proxy("--auth", "--version"))  # no SOCKS5_USER/SOCKS5_PASS
+        self.assert_version(self.start_proxy(
+            "--version", env=child_env(SOCKS5_USER="alice", SOCKS5_PASS="secret")))  # credentials without --auth
+
+    def test_version_from_stdin_says_proxy_py(self):
+        """CLI: 'python - --version < proxy.py' prints the same line (the program name is not '-')."""
+        with open(PROXY_PY, "rb") as script:
+            proc = self.start_proxy("--version", script="-", stdin=script)
+            self.assert_version(proc)
+
+
 class StdinExecutionTests(CliTestCase):
 
     def test_runs_from_stdin_and_writes_nothing_to_disk(self):
@@ -518,14 +561,19 @@ class StdinExecutionTests(CliTestCase):
 
             with open(script_path, "rb") as script:
                 proxy = self.start_proxy("--port", str(port), script="-", stdin=script, cwd=workdir)
-            proxy.wait_ready(port)
-            sock = self.tunnel(port, echo.port)
-            self.assert_echo(sock)
-            sock.close()
-            self.assertEqual(proxy.stop(), (0, b"", b""))
+            try:
+                proxy.wait_ready(port)
+                sock = self.tunnel(port, echo.port)
+                self.assert_echo(sock)
+                sock.close()
+                self.assertEqual(proxy.stop(), (0, b"", b""))
 
-            self.assertEqual(os.listdir(workdir), [], "the working directory was written to")
-            self.assertEqual(os.listdir(srcdir), ["proxy.py"], "something appeared next to proxy.py")
+                self.assertEqual(os.listdir(workdir), [], "the working directory was written to")
+                self.assertEqual(os.listdir(srcdir), ["proxy.py"], "something appeared next to proxy.py")
+            finally:
+                # Windows cannot delete a directory that a running child has as its working directory
+                # or as stdin, so a failed test must end the child before the directory goes.
+                proxy.close()
 
 
 class StartupFailureTests(CliTestCase):
@@ -673,6 +721,7 @@ class AuthTests(CliTestCase):
             self.assertNotIn(secret.encode("utf-8"), out + err)
         self.assertIn(b"username/password authentication", err)  # the startup line says auth is on
 
+    @unittest.skipIf(WINDOWS, "there is no /proc on Windows (Wine maps / but its pids are not the child's)")
     @unittest.skipUnless(os.path.exists("/proc/self/cmdline"), "needs /proc")
     def test_credentials_are_not_on_the_command_line(self):
         """CLI --auth: the secrets travel in the environment only, so 'ps' never shows them."""
@@ -700,7 +749,8 @@ class AuthTests(CliTestCase):
 class ShutdownTests(CliTestCase):
 
     def test_sigterm_with_an_established_connection_exits_promptly_with_status_0(self):
-        """CLI: SIGTERM cancels open connections and exits 0 within 3 s; both peers see the connection end."""
+        """CLI: SIGTERM (Ctrl-Break on Windows) cancels open connections and exits 0 within 3 s; both
+        peers see the connection end."""
         echo = self.start_echo_server()
         port = free_port()
         proxy = self.start_proxy("--port", str(port))
