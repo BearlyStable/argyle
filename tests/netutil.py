@@ -95,12 +95,25 @@ def abort_with_reset(writer):
     """Drop ``writer``'s connection the hard way: the peer sees a TCP reset, not a FIN."""
     sock = writer.get_extra_info("socket")
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-    writer.transport.abort()
     if sys.platform == "win32":
-        # The Proactor transport shuts its socket down (a FIN) before closing it, so the peer would
-        # see a clean EOF first and the reset only after it. abort() merely schedules that; closing
-        # the socket now sends the reset at once, and the transport skips shutting down a closed socket.
-        writer.transport._sock.close()
+        # The Proactor transport shuts its socket down (a FIN) before it closes it, so the peer would
+        # see a clean EOF first and the reset only after it. Its close then skips the shutdown. (Closing
+        # the socket early instead is no good: Python 3.8 shuts down even a closed socket, and fails.)
+        writer.transport._sock = _WithoutShutdown(writer.transport._sock)
+    writer.transport.abort()
+
+
+class _WithoutShutdown(object):
+    """A socket whose shutdown() does nothing; everything else goes to the real socket."""
+
+    def __init__(self, sock):
+        self._real = sock
+
+    def shutdown(self, how):
+        pass
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 def async_test(method=None, timeout=None):

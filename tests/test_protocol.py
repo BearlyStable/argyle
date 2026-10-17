@@ -1146,6 +1146,9 @@ class CloseWriterTests(ProtocolTestCase):
                 proxy.close_writer(writer)
                 received = await peer_reader.read()  # until EOF
                 peer_writer.close()
+                # Let the transport close its socket before the finally below does: Python 3.8's
+                # Proactor shuts down a socket that is already closed, and logs the failure.
+                await self.wait_until(lambda: theirs.fileno() == -1)
                 return received
             finally:
                 theirs.close()

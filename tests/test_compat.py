@@ -95,6 +95,13 @@ def imported_modules(source):
     return imported
 
 
+# Standard-library modules that exist on one platform only: before 3.10 a module that cannot be
+# imported here cannot be located either (test_hardening imports ``resource`` where it exists).
+PLATFORM_ONLY_STDLIB = frozenset((
+    "_overlapped", "_winapi", "fcntl", "grp", "msvcrt", "nt", "posix", "pwd", "resource", "termios",
+    "winreg", "winsound"))
+
+
 def is_standard_library(name):
     """True if ``name`` is a standard-library module. Python 3.10+ knows the list; older versions are
     asked where the module lives: built in, or a file in the standard library directory but not in
@@ -103,6 +110,8 @@ def is_standard_library(name):
     if names is not None:
         return name in names
     if name in sys.builtin_module_names:  # before find_spec: on 3.6/3.7 the spec of `sys` has no origin
+        return True
+    if name in PLATFORM_ONLY_STDLIB:
         return True
     try:
         spec = importlib.util.find_spec(name)
