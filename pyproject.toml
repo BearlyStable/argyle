@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "argyll"
+description = "A single-file, standard-library SOCKS5 CONNECT proxy built on asyncio."
+readme = "README.md"
+requires-python = ">=3.6"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "lazyfp" }]
+keywords = ["socks5", "socks", "proxy", "asyncio", "networking", "tcp", "rfc1928", "ctf"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: System :: Networking",
+    "Topic :: Security",
+]
+dynamic = ["version"]
+
+# The distribution is "argyll" (the Scottish namesake of the argyle sock
+# pattern; "argyle" and "proxy.py" were both taken on PyPI). The installed
+# command is "argyle", and the single source file ships as the module "argyll"
+# rather than "proxy" so it cannot shadow the common top-level name.
+[project.scripts]
+argyle = "argyll:main"
+
+[project.urls]
+Homepage = "https://github.com/BearlyStable/argyle"
+Repository = "https://github.com/BearlyStable/argyle"
+Issues = "https://github.com/BearlyStable/argyle/issues"
+
+[tool.hatch.version]
+path = "proxy.py"
+
+[tool.hatch.build.targets.wheel]
+force-include = { "proxy.py" = "argyll.py" }
+
+[tool.hatch.build.targets.sdist]
+include = ["proxy.py", "tests/", "README.md", "LICENSE", "CHANGELOG.md"]
