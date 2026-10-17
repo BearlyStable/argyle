@@ -10,8 +10,10 @@ name: tests
 
 on:
   push:
+    branches: ['**']   # branches only; a v* tag is tested via release.yml's reuse of this workflow
   pull_request:
   workflow_dispatch:
+  workflow_call:       # release.yml runs this whole suite as its gate before publishing
 
 permissions:
   contents: read
