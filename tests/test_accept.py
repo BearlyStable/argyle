@@ -16,6 +16,7 @@ import errno
 import gc
 import logging
 import os
+import re
 import socket
 import struct
 import sys
@@ -380,7 +381,10 @@ class BindFailureTests(OwnAcceptCase):
         expected, got = asyncio_failure.exception, own_failure.exception
         self.assertIs(type(got), type(expected))
         self.assertEqual(got.errno, expected.errno)
-        self.assertEqual(str(got), str(expected))
+        # Up to 3.11 asyncio gives only the lower-cased strerror after the colon; 3.12 added the
+        # "[errno N] " (Windows: "[winerror N] ") prefix, and the proxy uses that wording everywhere.
+        reason_prefix = re.compile(r": \[(?:errno|winerror) \d+\] ")
+        self.assertEqual(reason_prefix.sub(": ", str(got)), reason_prefix.sub(": ", str(expected)))
         self.assertIn("error while attempting to bind on address", str(got))
         self.assertEqual(server._accept_tasks, [])
 

@@ -15,6 +15,7 @@ import asyncio
 import functools
 import socket
 import struct
+import sys
 from unittest import mock
 
 from tests.support import AsyncTestCase, proxy
@@ -95,6 +96,11 @@ def abort_with_reset(writer):
     sock = writer.get_extra_info("socket")
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
     writer.transport.abort()
+    if sys.platform == "win32":
+        # The Proactor transport shuts its socket down (a FIN) before closing it, so the peer would
+        # see a clean EOF first and the reset only after it. abort() merely schedules that; closing
+        # the socket now sends the reset at once, and the transport skips shutting down a closed socket.
+        writer.transport._sock.close()
 
 
 def async_test(method=None, timeout=None):

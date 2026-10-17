@@ -687,6 +687,12 @@ class SignalFallbackTests(InProcessMainCase):
         def add_signal_handler(sig, callback, *args):
             raise NotImplementedError("this loop has no signal support")
         loop.add_signal_handler = add_signal_handler
+        if not WINDOWS:
+            # Like the Proactor loop (3.8+), which points the wakeup fd at its self-pipe so that a signal
+            # arriving just before it blocks still wakes it; without this, a signal landing between the
+            # loop's last check and epoll_wait() would sleep until the watchdog (seen on 3.6 in CI).
+            previous = signal.set_wakeup_fd(loop._csock.fileno())
+            self.addCleanup(signal.set_wakeup_fd, previous)  # runs before the loop is closed
 
     def setUp(self):
         InProcessMainCase.setUp(self)

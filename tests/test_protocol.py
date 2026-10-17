@@ -16,6 +16,7 @@ import io
 import itertools
 import os
 import socket
+import sys
 import time
 import unittest
 from unittest import mock
@@ -1118,7 +1119,11 @@ class CloseWriterTests(ProtocolTestCase):
             try:
                 _, writer = await asyncio.open_connection(sock=ours)
                 writer.write(b"x" * (8 * 1024 * 1024))  # the peer never reads: most stays buffered
-                self.assertGreater(writer.transport.get_write_buffer_size(), 0)
+                if sys.platform != "win32":
+                    # On Windows an overlapped send that completes at once hands everything to the
+                    # kernel, so nothing is left for the grace period to drop: close() releases the
+                    # socket straight away, which the wait below still checks.
+                    self.assertGreater(writer.transport.get_write_buffer_size(), 0)
                 with mock.patch.object(proxy, "CLOSE_GRACE", 0.05):
                     proxy.close_writer(writer)
                 await self.wait_until(lambda: ours.fileno() == -1)  # transport closed our socket
