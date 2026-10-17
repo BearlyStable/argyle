@@ -254,7 +254,7 @@ Linux the two Windows-only tests: the gh-93821 reset race and Ctrl-Break).
 Timing-based tests use short timeouts (fractions of a second up to a few seconds) with generous margins.
 
 ```bash
-python3 -m unittest discover -s tests -t . -v                # everything (about 90 s on a small Linux VM, faster on a fast desktop)
+python3 -m unittest discover -s tests -t . -v                # everything (about 2 minutes on a small Linux VM, 3 in strict mode)
 python3 -m unittest tests.test_protocol                      # just one module
 python3 -X dev -W error -m unittest discover -s tests -t .   # strict: any ResourceWarning becomes an error
 ```

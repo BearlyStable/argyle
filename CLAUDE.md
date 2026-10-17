@@ -9,16 +9,17 @@ the agent team in `.claude/agents/`.
 
 ```bash
 make check     # seconds: static Python 3.6 guards + protocol unit tests + hook tests (also the pre-commit hook)
-make test      # full suite, about 90 s on a small VM
-make strict    # same with -X dev -W error (what CI runs on Python 3.7+), about 100 s
+make test      # full suite, about 120 s on a small VM
+make strict    # same with -X dev -W error (what CI runs on Python 3.7+), about 170 s
 make py36      # full suite on Python 3.6: python3.6 on PATH, PY36=/path/to/python3.6, or Docker
 make counts    # tests per module, for the README table
 make hooks     # use .githooks/ as this clone's git hooks (once per clone)
 python3 proxy.py --port 0 --verbose    # run it; --port 0 picks a free port, shown in the log
 ```
 
-Slow modules: `test_hardening` (~35 s), `test_cli` (~28 s), `test_integration` (~11 s), `test_fuzz` (~3 s). Iterate with
-`make check` or a single module (`python3 -m unittest tests.test_cli`), run `make strict` before reporting done.
+Slow modules: `test_hardening` (~40 s), `test_cli` (~33 s), `test_integration` (~23 s), `test_fuzz` (~7 s),
+`test_accept` (~6 s). Iterate with `make check` or a single module (`python3 -m unittest tests.test_cli`), run
+`make strict` before reporting done.
 
 ## Hard constraints
 
