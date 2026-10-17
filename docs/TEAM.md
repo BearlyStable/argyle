@@ -49,13 +49,25 @@ pick item ─► architect ─► devils-advocate (plan) ─► test-engineer (r
 | One specialist directly | "Use the security-auditor agent to review the auth path" |
 
 Subagents cannot start other subagents, so orchestration happens in the main session: `lead` when started with
-`--agent lead`, otherwise the session you are in. `/agents` lists the agents Claude Code has loaded; run it after
-changing a file in `.claude/agents/` (a running session may need a restart to pick the change up).
+`--agent lead`, otherwise the session you are in. Claude Code loads the files in `.claude/agents/` at session start
+(the `/agents` wizard no longer exists); ask Claude which agent types it has, and restart the session after changing
+a file there.
 
 ## Guard rails (`.claude/settings.json`)
 
-- After every edit of `proxy.py` or `tests/*.py`, a hook checks that the file compiles and runs the static
-  Python 3.6 guards (`tests/test_compat.py`, a few seconds). Failure goes back to the agent that made the edit.
+- After every edit of `proxy.py` or `tests/*.py` with the Edit or Write tool, a hook checks that the file compiles
+  and runs the static Python 3.6 guards (`tests/test_compat.py`, a few seconds). Failure goes back to the agent that
+  made the edit. Edits made through Bash (`sed -i`, heredocs) do not trigger it; `make check` and the pre-commit
+  hook catch those later. The static guards cannot prove 3.6 compatibility (an f-string `{x=}` passes them): only
+  `make py36` or CI can.
+- Before every Bash command, `.claude/hooks/guard_git.py` splits the command line with `shlex` and blocks git
+  commits that skip the hooks (`-n` in any short-option group, any abbreviation of `--no-verify`,
+  `-c core.hooksPath=...`) and force-pushes (`-f`, `--force*`, `--mirror`, `+refspec`), also inside `sh -c '...'`.
+  Glob permission rules alone cannot do this; they missed `git commit -n` and `--force-with-lease`. Its tests run
+  in `make check`.
 - Allowed without asking: `make` targets, `unittest` runs, read-only git. Asked: `git push`, `git reset --hard`,
-  `git clean`, `rm -rf`. Denied: force-push, `--no-verify`, reading `.env`, SSH keys and Claude credentials.
-- `make hooks` makes git run `make check` before every commit (this clone only).
+  `git clean`, `rm -rf`. Denied by rule: reading `.env`, SSH keys and Claude credentials with the Read tool (a
+  `cat` through Bash is asked, not denied).
+- `make hooks` makes git run `make check` before every commit (this clone only), on the staged content exported to
+  a temporary directory, so unstaged edits cannot make a broken commit pass.
+- The "Can edit" column above is enforced by each agent's instructions and tool list, not by a permission rule.

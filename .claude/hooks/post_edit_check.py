@@ -17,6 +17,8 @@ def main():
         event = json.load(sys.stdin)
     except ValueError:
         return 0
+    if not isinstance(event, dict):
+        return 0
     path = (event.get("tool_input") or {}).get("file_path") or ""
     root = os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd") or os.getcwd()
     if not path:

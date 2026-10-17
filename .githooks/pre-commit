@@ -1,5 +1,10 @@
 #!/bin/sh
 # Enabled with `make hooks`. Fast checks only (about 10 s); the full suite belongs to /verify and CI.
+# The checks run on exactly what is being committed (the index, exported to a temporary directory), not on
+# the working tree, which can hold unstaged edits that would make a broken commit look green or a good one red.
 set -e
-cd "$(git rev-parse --show-toplevel)"
-exec make --no-print-directory check
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/argyle-pre-commit.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 1' INT TERM
+git checkout-index --all --prefix="$tmp/"
+make --no-print-directory -C "$tmp" check

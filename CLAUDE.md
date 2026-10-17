@@ -8,10 +8,10 @@ the agent team in `.claude/agents/`.
 ## Commands
 
 ```bash
-make check     # seconds: static Python 3.6 guards + protocol unit tests (also the pre-commit hook)
+make check     # seconds: static Python 3.6 guards + protocol unit tests + hook tests (also the pre-commit hook)
 make test      # full suite, about 90 s on a small VM
 make strict    # same with -X dev -W error (what CI runs on Python 3.7+), about 100 s
-make py36      # full suite on Python 3.6 in Docker (needs docker; not available on every machine)
+make py36      # full suite on Python 3.6: python3.6 on PATH, PY36=/path/to/python3.6, or Docker
 make counts    # tests per module, for the README table
 make hooks     # use .githooks/ as this clone's git hooks (once per clone)
 python3 proxy.py --port 0 --verbose    # run it; --port 0 picks a free port, shown in the log
